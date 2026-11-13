@@ -1,0 +1,73 @@
+import React from 'react';
+import { Modal, StatusBar, Pressable, Image, StyleSheet } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import CloseIcon from '../../assets/icons/close.svg';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import { Theme } from '../../styles/colors';
+import { pressedOpacity } from '../../styles/pressable';
+
+interface Props {
+  uri: string;
+  visible: boolean;
+  onClose: () => void;
+}
+
+const ImageLightbox = ({ uri, visible, onClose }: Props) => {
+  const insets = useSafeAreaInsets();
+  const { styles } = useThemedStyles(createStyles);
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="fade"
+      onRequestClose={onClose}
+      statusBarTranslucent
+    >
+      <StatusBar hidden />
+      <Pressable style={styles.backdrop} onPress={onClose}>
+        <Image source={{ uri }} style={styles.image} resizeMode="contain" />
+        <Pressable
+          style={({ pressed }) => [
+            styles.closeButton,
+            { top: insets.top + 16 },
+            pressed && pressedOpacity,
+          ]}
+          onPress={onClose}
+          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+        >
+          <CloseIcon width={24} height={24} style={styles.closeIcon} />
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+};
+
+export default ImageLightbox;
+
+const createStyles = (theme: Theme) =>
+  StyleSheet.create({
+    backdrop: {
+      flex: 1,
+      backgroundColor: theme.bg.lightbox,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    image: {
+      width: '100%',
+      height: '100%',
+    },
+    closeButton: {
+      position: 'absolute',
+      right: 20,
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      backgroundColor: theme.bg.lightboxControl,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    closeIcon: {
+      color: theme.text.onAttachButton,
+    },
+  });

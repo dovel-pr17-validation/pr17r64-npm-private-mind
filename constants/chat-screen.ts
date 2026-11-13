@@ -1,0 +1,55 @@
+import { Platform } from 'react-native';
+import { type Theme } from '../styles/colors';
+import { GLASS_BUTTON_SIZE, HEADER_EDGE_PX } from './header-actions';
+
+export const NEW_CHAT_HEADING = 'How can I help?';
+export const NEW_CHAT_REST_BOTTOM_FRACTION = 0.405;
+
+export const SUPPORTS_USER_ACTION_MENU = Platform.OS === 'android';
+
+export const USER_MESSAGE_BOTTOM_SPACING = 24;
+export const USER_ACTION_MENU_OFFSET = 6;
+export const LAYOUT_HEIGHT_CHANGE_THRESHOLD = 0.5;
+export const MESSAGE_ACTION_ROW_HEIGHT = 24;
+
+export const FADE_HEIGHT = 24;
+export const FADE_GAP_TRIM = 5;
+export const SEAM_OVERLAP = 1;
+export const BOTTOM_FADE_HEIGHT = Platform.OS === 'ios' ? 64 : FADE_HEIGHT;
+
+export const SCROLL_INDICATOR_GUTTER = 12;
+export const MESSAGE_LIST_SIDE_PADDING = 16;
+
+export const GENERATION_ERROR_MEASUREMENT_KEY = 'generation-error';
+
+export const MESSAGE_PIN_OFFSET = 8;
+
+export const PIN_READY_SLACK_PX = 1;
+
+export const MESSAGE_PIN_SETTLE_MS = 500;
+
+export const PIN_LANDING_GRACE_MS = 600;
+
+export const REVEAL_FALLBACK_MS = 900;
+
+export const navBarInset = (theme: Theme) =>
+  Platform.OS === 'android' ? theme.insets.bottom : 0;
+
+export const MESSAGE_PIN_LANDING_PX = 64;
+
+export const PIN_RELEASE_SETTLE_DELAY_MS = 50;
+
+export const PIN_FREEZE_FALLBACK_MS = 1000;
+
+export const HEADER_TITLE_GAP_PX = 8;
+
+export const headerTitleMaxWidth = (
+  width: number,
+  insets: { left: number; right: number }
+) =>
+  width -
+  2 *
+    (HEADER_EDGE_PX +
+      GLASS_BUTTON_SIZE +
+      HEADER_TITLE_GAP_PX +
+      Math.max(insets.left, insets.right));

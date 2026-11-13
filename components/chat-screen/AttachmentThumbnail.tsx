@@ -1,0 +1,210 @@
+import React, { useEffect } from 'react';
+import {
+  View,
+  Text,
+  Pressable,
+  ActivityIndicator,
+  StyleSheet,
+} from 'react-native';
+import { Image } from 'expo-image';
+import Animated, {
+  Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import { Theme } from '../../styles/colors';
+import { fontFamily, fontSizes } from '../../styles/fontStyles';
+import CloseIcon from '../../assets/icons/close.svg';
+import AttachmentIcon from '../../assets/icons/attachment.svg';
+import { Attachment } from '../../hooks/useAttachment';
+import { ATTACHMENT_PROGRESS_TRACK_WIDTH } from '../../constants/chat';
+import { pressedOpacity } from '../../styles/pressable';
+import { stroke } from '../../constants/design-system';
+import { COMPOSER_THUMB_RADIUS } from './attachments/constants';
+
+interface Props {
+  attachment: Attachment;
+  onRemove: () => void;
+}
+
+const AttachmentThumbnail = ({ attachment, onRemove }: Props) => {
+  const { styles, theme } = useThemedStyles(createStyles);
+
+  const fill = useSharedValue(0);
+  useEffect(() => {
+    if (attachment.progress == null) return;
+    fill.set(
+      withTiming(attachment.progress * ATTACHMENT_PROGRESS_TRACK_WIDTH, {
+        duration: 250,
+        easing: Easing.out(Easing.cubic),
+      })
+    );
+  }, [attachment.progress, fill]);
+
+  const fillStyle = useAnimatedStyle(() => ({ width: fill.get() }));
+
+  const renderContent = () => {
+    if (attachment.type === 'image') {
+      return (
+        <>
+          <Image
+            source={attachment.uri}
+            recyclingKey={attachment.id}
+            contentFit="cover"
+            cachePolicy="memory-disk"
+            transition={0}
+            style={styles.thumbnail}
+            testID="attachment-image-preview"
+          />
+          {attachment.status === 'loading' && (
+            <View style={[styles.thumbnail, styles.imageLoading]}>
+              <ActivityIndicator color={theme.text.contrastPrimary} />
+            </View>
+          )}
+        </>
+      );
+    }
+
+    if (attachment.status === 'loading') {
+      if (attachment.progress == null) {
+        return (
+          <View style={styles.placeholder}>
+            <ActivityIndicator color={theme.text.primary} />
+          </View>
+        );
+      }
+
+      return (
+        <View style={styles.docThumbnail}>
+          <AttachmentIcon
+            width={18}
+            height={18}
+            style={{ color: theme.text.primary }}
+          />
+          <Text style={styles.percentText}>
+            {Math.round(attachment.progress * 100)}%
+          </Text>
+          <View style={styles.progressTrack}>
+            <Animated.View style={[styles.progressFill, fillStyle]} />
+          </View>
+        </View>
+      );
+    }
+
+    return (
+      <View style={styles.docThumbnail}>
+        <AttachmentIcon
+          width={22}
+          height={22}
+          style={{ color: theme.text.primary }}
+        />
+        <Text style={styles.fileName} numberOfLines={1}>
+          {attachment.name || 'Document'}
+        </Text>
+      </View>
+    );
+  };
+
+  return (
+    <View style={styles.wrapper} testID={`attachment-thumb-${attachment.id}`}>
+      {renderContent()}
+      <Pressable
+        style={({ pressed }) => [
+          styles.dismissButton,
+          pressed && pressedOpacity,
+        ]}
+        onPress={onRemove}
+        testID={`attachment-dismiss-${attachment.id}`}
+      >
+        <CloseIcon width={8} height={8} style={styles.dismissIcon} />
+      </Pressable>
+    </View>
+  );
+};
+
+export default AttachmentThumbnail;
+
+const createStyles = (theme: Theme) =>
+  StyleSheet.create({
+    wrapper: {
+      position: 'relative',
+    },
+    thumbnail: {
+      width: 72,
+      height: 72,
+      borderRadius: COMPOSER_THUMB_RADIUS,
+      borderWidth: stroke.soft,
+      borderColor: theme.border.chatBar,
+    },
+    imageLoading: {
+      position: 'absolute',
+      left: 0,
+      top: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.bg.overlay,
+    },
+    placeholder: {
+      width: 72,
+      height: 72,
+      borderRadius: COMPOSER_THUMB_RADIUS,
+      borderWidth: stroke.soft,
+      borderColor: theme.border.chatBar,
+      backgroundColor: theme.bg.softPrimary,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    docThumbnail: {
+      width: 72,
+      height: 72,
+      borderRadius: COMPOSER_THUMB_RADIUS,
+      borderWidth: stroke.soft,
+      borderColor: theme.border.chatBar,
+      backgroundColor: theme.bg.softPrimary,
+      justifyContent: 'center',
+      alignItems: 'center',
+      gap: 4,
+      padding: 4,
+    },
+    fileName: {
+      fontSize: fontSizes.xxs,
+      fontFamily: fontFamily.regular,
+      color: theme.text.primary,
+      maxWidth: 60,
+      textAlign: 'center',
+    },
+    percentText: {
+      fontSize: fontSizes.sm,
+      fontFamily: fontFamily.medium,
+      color: theme.text.primary,
+      fontVariant: ['tabular-nums'],
+    },
+    progressTrack: {
+      width: ATTACHMENT_PROGRESS_TRACK_WIDTH,
+      height: 4,
+      borderRadius: 2,
+      backgroundColor: theme.bg.softSecondary,
+      overflow: 'hidden',
+    },
+    progressFill: {
+      height: 4,
+      borderRadius: 2,
+      backgroundColor: theme.bg.strongPrimary,
+    },
+    dismissButton: {
+      position: 'absolute',
+      top: -6,
+      right: -6,
+      width: 20,
+      height: 20,
+      borderRadius: 10,
+      backgroundColor: theme.bg.strongPrimary,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    dismissIcon: {
+      color: theme.text.contrastPrimary,
+    },
+  });

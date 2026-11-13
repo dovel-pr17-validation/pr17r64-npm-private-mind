@@ -1,0 +1,697 @@
+import React from 'react';
+import { PixelRatio, StyleSheet } from 'react-native';
+import type { ViewProps } from 'react-native';
+import { fireEvent, render, screen } from '@testing-library/react-native';
+
+type MockLLMState = {
+  isGenerating: boolean;
+  isProcessingPrompt: boolean;
+  isRefining?: boolean;
+  isSearchingWeb?: boolean;
+  webSearchTrace?: unknown[];
+};
+
+type MockLLMSelector<T = MockLLMState> = (state: MockLLMState) => T;
+
+type MockWebSearchState = {
+  isSearchingWeb: boolean;
+  webSearchTrace: unknown[];
+};
+
+type MockWebSearchSelector<T = MockWebSearchState> = (
+  state: MockWebSearchState
+) => T;
+
+type ThinkingBlockMockProps = {
+  content: string;
+  isComplete: boolean;
+  inProgress: boolean;
+};
+
+type BottomSheetModalHandle = {
+  present: jest.Mock;
+  dismiss: jest.Mock;
+};
+
+type BottomSheetModalMockProps = {
+  children?: React.ReactNode;
+};
+
+jest.mock('../context/ThemeContext', () => ({
+  useTheme: () => ({
+    theme: {
+      ...require('../styles/colors').lightTheme,
+      insets: { top: 0, bottom: 0, left: 0, right: 0 },
+    },
+  }),
+}));
+
+jest.mock('../store/llmStore', () => ({
+  useLLMStore: jest.fn(<T,>(selector?: MockLLMSelector<T>) => {
+    const state = { isGenerating: false, isProcessingPrompt: false };
+    return selector ? selector(state) : state;
+  }),
+}));
+
+jest.mock('../store/webSearchStore', () => ({
+  useWebSearchStore: jest.fn(<T,>(selector?: MockWebSearchSelector<T>) => {
+    const state = {
+      isSearchingWeb: false,
+      webSearchTrace: [],
+    };
+    return selector ? selector(state) : state;
+  }),
+}));
+
+jest.mock('../components/chat-screen/MarkdownComponent', () => {
+  const { Text } = require('react-native');
+  return ({ text }: { text: string }) => <Text testID="markdown">{text}</Text>;
+});
+
+jest.mock('../components/chat-screen/ThinkingBlock', () => {
+  const { Text } = require('react-native');
+  return ({ content, isComplete, inProgress }: ThinkingBlockMockProps) => (
+    <Text
+      testID="thinking-block"
+      accessibilityLabel={`complete:${isComplete} inProgress:${inProgress}`}
+    >
+      {content}
+    </Text>
+  );
+});
+
+jest.mock('../components/chat-screen/AnimatedChatLoading', () => {
+  const { Text } = require('react-native');
+  return ({ label }: { label: string }) => (
+    <Text testID="chat-loading">{label}</Text>
+  );
+});
+
+jest.mock('../components/chat-screen/WebSearchBlock', () => {
+  const { Text } = require('react-native');
+  return ({ isSearching }: { isSearching?: boolean }) => (
+    <Text
+      testID="web-search-block"
+      accessibilityLabel={`searching:${!!isSearching}`}
+    >
+      {''}
+    </Text>
+  );
+});
+
+jest.mock('@gorhom/bottom-sheet', () => {
+  const MockReact = require('react') as typeof import('react');
+  const { View } = require('react-native');
+
+  const BottomSheetModal = MockReact.forwardRef<
+    BottomSheetModalHandle,
+    BottomSheetModalMockProps
+  >(({ children }, ref) => {
+    MockReact.useImperativeHandle(ref, () => ({
+      present: jest.fn(),
+      dismiss: jest.fn(),
+    }));
+    return <View testID="bottom-sheet-modal">{children}</View>;
+  });
+
+  return {
+    BottomSheetBackdrop: (props: ViewProps) => <View {...props} />,
+    BottomSheetModal,
+    BottomSheetView: View,
+    BottomSheetScrollView: View,
+    useBottomSheet: () => ({ close: jest.fn() }),
+    useBottomSheetSpringConfigs: (config: unknown) => config,
+  };
+});
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+import MessageItem from '../components/chat-screen/MessageItem';
+import { useLLMStore } from '../store/llmStore';
+import { useWebSearchStore } from '../store/webSearchStore';
+import { useSettingsStore } from '../store/settingsStore';
+
+const mockUseLLMStore = useLLMStore as unknown as jest.Mock;
+const mockUseWebSearchStore = useWebSearchStore as unknown as jest.Mock;
+
+const setLLMState = (state: MockLLMState) => {
+  mockUseLLMStore.mockImplementation((selector?: MockLLMSelector) =>
+    selector ? selector(state) : state
+  );
+  const webState: MockWebSearchState = {
+    isSearchingWeb: state.isSearchingWeb ?? false,
+    webSearchTrace: state.webSearchTrace ?? [],
+  };
+  mockUseWebSearchStore.mockImplementation(
+    (selector?: MockWebSearchSelector) =>
+      selector ? selector(webState) : webState
+  );
+};
+
+const baseMessage = {
+  id: 1,
+  role: 'assistant',
+  content: 'Hello world',
+  chatId: 1,
+  timestamp: 0,
+} as React.ComponentProps<typeof MessageItem>['message'];
+
+const renderItem = (
+  props: Partial<React.ComponentProps<typeof MessageItem>> = {}
+) =>
+  render(
+    <MessageItem
+      message={baseMessage}
+      content="Hello world"
+      role="assistant"
+      isLastMessage={false}
+      {...props}
+    />
+  );
+
+beforeEach(() => {
+  setLLMState({ isGenerating: false, isProcessingPrompt: false });
+  useSettingsStore.setState({ showPerformanceMetrics: true });
+  jest.spyOn(console, 'error').mockImplementation(() => {});
+});
+
+afterEach(() => {
+  jest.restoreAllMocks();
+});
+
+// ─── event messages ───────────────────────────────────────────────────────────
+
+describe('event messages', () => {
+  it('renders event message with filename and text parts', () => {
+    renderItem({ role: 'event', content: 'document.pdf was added' });
+    // The outer Text contains "document.pdf " as direct text — match with substring
+    expect(screen.getByText(/document\.pdf/, { exact: false })).toBeTruthy();
+    expect(screen.getByText('was added')).toBeTruthy();
+  });
+
+  it('does not render a MarkdownComponent for event messages', () => {
+    renderItem({ role: 'event', content: 'file.txt uploaded' });
+    expect(screen.queryByTestId('markdown')).toBeNull();
+  });
+});
+
+describe('a response the user stopped', () => {
+  it('offers no copy, fork or sources on an answer that never finished', () => {
+    renderItem({
+      message: { ...baseMessage, stoppedByUser: true },
+      showActions: true,
+      showForkAction: true,
+      onCopy: jest.fn(),
+      onFork: jest.fn(),
+    });
+
+    expect(screen.queryByTestId('message-actions')).toBeNull();
+  });
+
+  it('keeps them on an answer that finished', () => {
+    renderItem({
+      message: baseMessage,
+      showActions: true,
+      showForkAction: true,
+      onCopy: jest.fn(),
+      onFork: jest.fn(),
+    });
+
+    expect(screen.getByTestId('message-actions')).toBeTruthy();
+  });
+});
+
+// ─── assistant messages ───────────────────────────────────────────────────────
+
+describe('assistant messages', () => {
+  it('shows the model name above the thinking label before the first token', () => {
+    setLLMState({ isGenerating: false, isProcessingPrompt: true });
+    renderItem({ content: '', isLastMessage: true, modelName: 'Llama-3B' });
+
+    expect(screen.getByText('Llama-3B')).toBeTruthy();
+    expect(screen.getByTestId('chat-loading').props.children).toBe(
+      'Generating…'
+    );
+  });
+
+  it('renders the model name', () => {
+    renderItem({ role: 'assistant', content: 'Hi', modelName: 'Llama-3B' });
+    expect(screen.getByText('Llama-3B')).toBeTruthy();
+  });
+
+  it('renders content via MarkdownComponent', () => {
+    renderItem({ role: 'assistant', content: 'Some response' });
+    expect(screen.getByTestId('markdown')).toBeTruthy();
+    expect(screen.getByText('Some response')).toBeTruthy();
+  });
+
+  it('renders metadata when tokensPerSecond is provided and non-zero', () => {
+    renderItem({
+      role: 'assistant',
+      content: 'Hi',
+      tokensPerSecond: 12.5,
+      timeToFirstToken: 300,
+    });
+    expect(screen.getByText(/tps:/)).toBeTruthy();
+    expect(screen.getByText(/ttft:/)).toBeTruthy();
+  });
+
+  it('does not render metadata when tokensPerSecond is 0', () => {
+    renderItem({ role: 'assistant', content: 'Hi', tokensPerSecond: 0 });
+    expect(screen.queryByText(/tps:/)).toBeNull();
+  });
+
+  it('does not render metadata when tokensPerSecond is undefined', () => {
+    renderItem({ role: 'assistant', content: 'Hi' });
+    expect(screen.queryByText(/tps:/)).toBeNull();
+  });
+
+  it('does not render metadata when the performance stats setting is off', () => {
+    useSettingsStore.setState({ showPerformanceMetrics: false });
+    renderItem({
+      role: 'assistant',
+      content: 'Hi',
+      tokensPerSecond: 12.5,
+      timeToFirstToken: 300,
+    });
+    expect(screen.queryByText(/tps:/)).toBeNull();
+    expect(screen.queryByText(/ttft:/)).toBeNull();
+  });
+
+  it('hands deduplicated sources to onShowSources when the sources button is pressed', () => {
+    const onShowSources = jest.fn();
+    renderItem({
+      role: 'assistant',
+      content: 'The answer is in the report.',
+      userQuestion: 'What was the revenue?',
+      sourceDocuments: [
+        { documentId: 1, name: 'financial_report.pdf' },
+        { documentId: 1, name: 'financial_report.pdf' },
+      ],
+      onShowSources,
+    });
+
+    expect(screen.getByTestId('source-action-button')).toBeTruthy();
+    expect(screen.getByLabelText('Sources')).toBeTruthy();
+
+    fireEvent.press(screen.getByTestId('source-action-button'));
+
+    expect(onShowSources).toHaveBeenCalledWith(
+      [{ documentId: 1, name: 'financial_report.pdf' }],
+      'What was the revenue?'
+    );
+  });
+
+  it('strips inline [n] citation markers from the rendered answer', () => {
+    renderItem({
+      role: 'assistant',
+      content: 'The total was 100 [1].',
+      sourceDocuments: [{ documentId: 1, name: 'financial_report.pdf' }],
+    });
+
+    const markdown = screen.getByTestId('markdown');
+    expect(markdown.props.children).toBe('The total was 100.');
+  });
+
+  it('strips a leaked tokenizer placeholder from the rendered answer (#342)', () => {
+    renderItem({
+      role: 'assistant',
+      content: 'Office Environment:<unused6226><unused6226>感 (focus).',
+    });
+
+    const markdown = screen.getByTestId('markdown');
+    expect(markdown.props.children).toBe('Office Environment:感 (focus).');
+  });
+
+  it('offers the Sources button whenever a source badge is shown, even for a page known only from its listing (#357)', () => {
+    renderItem({
+      role: 'assistant',
+      content: 'Najlepszym modelem OLED w rankingu jest LG C5.',
+      userQuestion: 'najlepszy model telewizora OLED',
+      sourceDocuments: [
+        {
+          kind: 'web',
+          name: 'Ranking Telewizorów OLED 2026',
+          url: 'https://ranking.example/oled',
+          read: false,
+          used: true,
+        },
+        {
+          kind: 'web',
+          name: 'Sklep',
+          url: 'https://shop.example/tv',
+          read: true,
+          used: false,
+        },
+      ],
+    });
+
+    expect(screen.getByTestId('dominant-source-badge')).toBeTruthy();
+    expect(screen.getByTestId('source-action-button')).toBeTruthy();
+  });
+
+  it('does not render source actions for user messages', () => {
+    renderItem({
+      role: 'user',
+      content: 'Question',
+      sourceDocuments: [{ documentId: 1, name: 'notes.txt' }],
+    });
+
+    expect(screen.queryByTestId('source-action-button')).toBeNull();
+  });
+
+  it('does not render source actions while the last assistant message is generating', () => {
+    setLLMState({
+      isGenerating: true,
+      isProcessingPrompt: false,
+    });
+
+    renderItem({
+      role: 'assistant',
+      content: 'Streaming answer',
+      isLastMessage: true,
+      sourceDocuments: [{ documentId: 1, name: 'report.pdf' }],
+    });
+
+    expect(screen.queryByTestId('source-action-button')).toBeNull();
+  });
+});
+
+// ─── user messages ────────────────────────────────────────────────────────────
+
+describe('user messages', () => {
+  it('does not render model name for user messages', () => {
+    renderItem({ role: 'user', content: 'Hello', modelName: 'Llama-3B' });
+    expect(screen.queryByText('Llama-3B')).toBeNull();
+  });
+
+  it('renders user content via MarkdownComponent', () => {
+    renderItem({ role: 'user', content: 'My question' });
+    expect(screen.getByText('My question')).toBeTruthy();
+  });
+
+  it('leaves a token the reader typed themselves, even one a model would emit', () => {
+    renderItem({ role: 'user', content: 'What does <eos> mean?' });
+    expect(screen.getByText('What does <eos> mean?')).toBeTruthy();
+  });
+
+  it('keeps the text of a pasted <think> block, dropping only the markers', () => {
+    renderItem({
+      role: 'user',
+      content: 'Pytanie <think>notatka</think> dalej',
+    });
+
+    expect(screen.getByText('Pytanie notatka dalej')).toBeTruthy();
+    expect(screen.queryByTestId('thinking-block')).toBeNull();
+  });
+
+  it('keeps the text of a pasted unterminated <think> block', () => {
+    renderItem({ role: 'user', content: 'Look at this: <think>cut off' });
+
+    expect(screen.getByText('Look at this: cut off')).toBeTruthy();
+  });
+
+  it('draws no blank line under a message stored with a trailing newline (#399)', () => {
+    renderItem({
+      role: 'user',
+      content: 'Help me write a Python function.\n',
+    });
+
+    expect(
+      screen.getByText('Help me write a Python function.').props.children
+    ).toBe('Help me write a Python function.');
+  });
+
+  it('keeps the bubble width on the pixel grid, so iOS measures the text at the width it draws it (#399)', () => {
+    jest.spyOn(PixelRatio, 'get').mockReturnValue(3);
+    renderItem({
+      role: 'user',
+      content:
+        'Help me write a Python function to sort a list of dictionaries by a specific key.',
+    });
+    const bubble = screen.getByTestId('text-bubble');
+
+    fireEvent(bubble.parent!, 'layout', {
+      nativeEvent: { layout: { x: 0, y: 0, width: 370, height: 120 } },
+    });
+
+    const maxWidth = StyleSheet.flatten(
+      screen.getByTestId('text-bubble').props.style
+    ).maxWidth as number;
+    expect(typeof maxWidth).toBe('number');
+    expect(maxWidth * 3).toBe(Math.round(maxWidth * 3));
+    expect(maxWidth).toBeLessThanOrEqual(370 * 0.65);
+    expect(maxWidth).toBeCloseTo(370 * 0.65, 0);
+  });
+
+  it('sizes the bubble on the pixel grid from its first frame, so the text is never measured at a second width (I-140)', () => {
+    jest.spyOn(PixelRatio, 'get').mockReturnValue(3);
+    jest
+      .spyOn(require('react-native'), 'useWindowDimensions')
+      .mockReturnValue({ width: 402, height: 874, scale: 3, fontScale: 1 });
+    renderItem({
+      role: 'user',
+      content: 'Now write a very long story about a dragon',
+    });
+
+    const maxWidth = StyleSheet.flatten(
+      screen.getByTestId('text-bubble').props.style
+    ).maxWidth as number;
+    expect(typeof maxWidth).toBe('number');
+    expect(maxWidth * 3).toBe(Math.round(maxWidth * 3));
+    expect(maxWidth).toBeCloseTo((402 - 32) * 0.65, 0);
+  });
+});
+
+// ─── user messages with image ─────────────────────────────────────────────────
+
+describe('user messages with image', () => {
+  it('renders image as a separate bubble from text', () => {
+    renderItem({
+      role: 'user',
+      content: 'Check this out',
+      imagePath: 'file://test.jpg',
+    });
+    const image = screen.getByTestId('message-image');
+    expect(image.props.source).toEqual({ uri: 'file://test.jpg' });
+    expect(screen.getByText('Check this out')).toBeTruthy();
+    // Image bubble and text bubble should be separate Views
+    expect(screen.getByTestId('image-bubble')).toBeTruthy();
+    expect(screen.getByTestId('text-bubble')).toBeTruthy();
+  });
+
+  it('renders text-only bubble when imagePath is absent', () => {
+    renderItem({ role: 'user', content: 'Hello there' });
+    expect(screen.queryByTestId('message-image')).toBeNull();
+    expect(screen.queryByTestId('image-bubble')).toBeNull();
+    expect(screen.getByText('Hello there')).toBeTruthy();
+  });
+
+  it('does not render image for assistant messages even if imagePath is provided', () => {
+    renderItem({
+      role: 'assistant',
+      content: 'Response',
+      imagePath: 'file://test.jpg',
+    });
+    expect(screen.queryByTestId('message-image')).toBeNull();
+  });
+});
+
+// ─── user messages with document ──────────────────────────────────────────────
+
+describe('user messages with document', () => {
+  it('renders document as a separate bubble from text', () => {
+    renderItem({
+      role: 'user',
+      content: 'Summarize this',
+      documentName: 'report.pdf',
+    });
+    expect(screen.getByTestId('message-document')).toBeTruthy();
+    expect(screen.getByTestId('document-bubble')).toBeTruthy();
+    expect(screen.getByTestId('text-bubble')).toBeTruthy();
+    expect(screen.getByText('report')).toBeTruthy();
+    expect(screen.getByText('PDF')).toBeTruthy();
+    expect(screen.getByText('Summarize this')).toBeTruthy();
+  });
+
+  it('keeps the whole name when it has no usable extension', () => {
+    renderItem({ role: 'user', content: '', documentName: 'meeting notes' });
+    expect(screen.getByText('meeting notes')).toBeTruthy();
+    expect(screen.getByText('Document')).toBeTruthy();
+  });
+
+  it('does not render document bubble when documentName is absent', () => {
+    renderItem({ role: 'user', content: 'Hello' });
+    expect(screen.queryByTestId('message-document')).toBeNull();
+    expect(screen.queryByTestId('document-bubble')).toBeNull();
+  });
+
+  it('renders document bubble without text bubble when content is empty', () => {
+    renderItem({ role: 'user', content: '', documentName: 'notes.txt' });
+    expect(screen.getByTestId('document-bubble')).toBeTruthy();
+    expect(screen.queryByTestId('text-bubble')).toBeNull();
+  });
+
+  it('does not render document bubble for assistant messages', () => {
+    renderItem({
+      role: 'assistant',
+      content: 'Response',
+      documentName: 'doc.pdf',
+    });
+    expect(screen.queryByTestId('message-document')).toBeNull();
+  });
+});
+
+// ─── user messages with both image and document ──────────────────────────────
+
+describe('user messages with image and document', () => {
+  it('renders image bubble, document bubble, and text bubble separately', () => {
+    renderItem({
+      role: 'user',
+      content: 'Analyze both',
+      imagePath: 'file://photo.jpg',
+      documentName: 'data.pdf',
+    });
+    expect(screen.getByTestId('image-bubble')).toBeTruthy();
+    expect(screen.getByTestId('document-bubble')).toBeTruthy();
+    expect(screen.getByTestId('text-bubble')).toBeTruthy();
+  });
+});
+
+// ─── thinking block parsing ───────────────────────────────────────────────────
+
+describe('thinking block parsing', () => {
+  it('does not render ThinkingBlock when there is no <think> tag', () => {
+    renderItem({ content: 'Plain response' });
+    expect(screen.queryByTestId('thinking-block')).toBeNull();
+  });
+
+  it('renders ThinkingBlock with complete=true for closed <think> tag', () => {
+    renderItem({ content: '<think>some reasoning</think>Final answer' });
+    const block = screen.getByTestId('thinking-block');
+    expect(block).toBeTruthy();
+    expect(block.props.accessibilityLabel).toContain('complete:true');
+    expect(screen.getByText('some reasoning')).toBeTruthy();
+  });
+
+  it('renders ThinkingBlock with complete=false for unclosed <think> tag (streaming)', () => {
+    renderItem({ content: '<think>still thinking...', isLastMessage: true });
+    const block = screen.getByTestId('thinking-block');
+    expect(block.props.accessibilityLabel).toContain('complete:false');
+  });
+
+  it('renders normal content after </think> via MarkdownComponent', () => {
+    renderItem({ content: '<think>reasoning</think>This is the answer' });
+    const markdowns = screen.getAllByTestId('markdown');
+    const texts = markdowns.map((el) => el.props.children);
+    expect(texts).toContain('This is the answer');
+  });
+
+  it('marks ThinkingBlock as inProgress when last message and isGenerating and thinking is incomplete', () => {
+    setLLMState({ isGenerating: true, isProcessingPrompt: false });
+    renderItem({ content: '<think>working...', isLastMessage: true });
+    const block = screen.getByTestId('thinking-block');
+    expect(block.props.accessibilityLabel).toContain('inProgress:true');
+  });
+
+  it('does not mark ThinkingBlock as inProgress when not isLastMessage', () => {
+    setLLMState({ isGenerating: true, isProcessingPrompt: false });
+    renderItem({ content: '<think>working...', isLastMessage: false });
+    const block = screen.getByTestId('thinking-block');
+    expect(block.props.accessibilityLabel).toContain('inProgress:false');
+  });
+
+  it('does not render ThinkingBlock when thinking content is empty whitespace', () => {
+    renderItem({ content: '<think>   </think>answer' });
+    expect(screen.queryByTestId('thinking-block')).toBeNull();
+  });
+});
+
+describe('nudge retry', () => {
+  it('keeps the first answer visible and marks it as refining while the retry generates', () => {
+    setLLMState({
+      isGenerating: true,
+      isProcessingPrompt: false,
+      isRefining: true,
+    });
+    renderItem({
+      content: 'Bitcoin kosztuje 98 000 USD.',
+      isLastMessage: true,
+    });
+
+    expect(screen.getByTestId('markdown').props.children).toBe(
+      'Bitcoin kosztuje 98 000 USD.'
+    );
+    expect(screen.getByTestId('chat-loading').props.children).toBe('Refining…');
+  });
+
+  it('shows no refining indicator on a message that is not being retried', () => {
+    setLLMState({
+      isGenerating: true,
+      isProcessingPrompt: false,
+      isRefining: true,
+    });
+    renderItem({
+      content: 'Bitcoin kosztuje 98 000 USD.',
+      isLastMessage: false,
+    });
+
+    expect(screen.queryByTestId('chat-loading')).toBeNull();
+  });
+});
+
+describe('live web-search trace', () => {
+  it('shows the web trace in the searching state while searching the web', () => {
+    setLLMState({
+      isGenerating: false,
+      isProcessingPrompt: true,
+      isSearchingWeb: true,
+      webSearchTrace: [],
+    });
+    renderItem({ content: '', isLastMessage: true });
+
+    const block = screen.getByTestId('web-search-block');
+    expect(block).toBeTruthy();
+    expect(block.props.accessibilityLabel).toBe('searching:true');
+  });
+
+  it('is not in the searching state once tokens have started streaming', () => {
+    setLLMState({
+      isGenerating: true,
+      isProcessingPrompt: false,
+      isSearchingWeb: true,
+      webSearchTrace: [],
+    });
+    renderItem({ content: 'Dzisiaj jest słonecznie', isLastMessage: true });
+
+    expect(screen.queryByTestId('web-search-block')).toBeNull();
+  });
+
+  it('keeps the trace on the last message while it streams after a search that found nothing', () => {
+    setLLMState({
+      isGenerating: true,
+      isProcessingPrompt: false,
+      isSearchingWeb: false,
+      webSearchTrace: [
+        { type: 'searching', query: 'Samsung QE65QN90D Hz' },
+        { type: 'done' },
+      ],
+    });
+    renderItem({ content: 'Nie znalazłem tej danej.', isLastMessage: true });
+
+    const block = screen.getByTestId('web-search-block');
+    expect(block.props.accessibilityLabel).toBe('searching:false');
+  });
+
+  it('does not show the searching trace on a non-last message', () => {
+    setLLMState({
+      isGenerating: false,
+      isProcessingPrompt: true,
+      isSearchingWeb: true,
+      webSearchTrace: [],
+    });
+    renderItem({ content: '', isLastMessage: false });
+
+    expect(screen.queryByTestId('web-search-block')).toBeNull();
+  });
+});

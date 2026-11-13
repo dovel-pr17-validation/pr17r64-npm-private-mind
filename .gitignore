@@ -1,0 +1,66 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# Worktrees and superpowers
+.worktrees/
+.superpowers/
+docs/superpowers/
+
+# Claude / agents / MCP / editor
+.claude/
+.agents/
+.mcp.json
+.vscode/
+skills-lock.json
+docs/chat-testing-checklist.md
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+.yarn/cache
+.yarn/install-state.gz
+
+android/app/release
+
+
+key_local_mind
+android/local.properties
+
+
+coverage/
+# Argent device-automation scratch (recordings, flows)
+.argent/
+
+build/

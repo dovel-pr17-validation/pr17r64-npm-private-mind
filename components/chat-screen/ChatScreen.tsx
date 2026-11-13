@@ -1,0 +1,532 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Keyboard,
+  StyleSheet,
+  View,
+  type LayoutChangeEvent,
+} from 'react-native';
+import { BottomSheetModal } from '@gorhom/bottom-sheet';
+import { useIsFocused } from 'expo-router';
+import { useHeaderHeight } from 'expo-router/react-navigation';
+import { useKeyboardLift } from './useKeyboardLift';
+import { useModelSwitch } from './useModelSwitch';
+import { useSendChatMessage } from './useSendChatMessage';
+import { useChatScreenLayout } from './useChatScreenLayout';
+import { useChatScreenActions } from './useChatScreenActions';
+import Animated, {
+  FadeInUp,
+  FadeOutUp,
+  useAnimatedStyle,
+  useReducedMotion,
+  useSharedValue,
+} from 'react-native-reanimated';
+import type { MessagesHandle } from './Messages';
+import { useLLMStore } from '../../store/llmStore';
+import { useChatStore } from '../../store/chatStore';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import { Chat, type Message } from '../../database/chatRepository';
+import { Model } from '../../database/modelRepository';
+import Messages from './Messages';
+import ChatBar from './ChatBar';
+import NewChatHero from './NewChatHero';
+import { useHeadingAnchor } from './useHeadingAnchor';
+import NewChatSwarm, {
+  SWARM_CLEARANCE_WITH_PROMPTS,
+  useSwarmOncePerNewChat,
+} from './NewChatSwarm';
+import { TopFade, topFadeHeight } from './TopFade';
+import { NewChatBackground } from './NewChatBackground';
+import UserMessageActionMenu from './UserMessageActionMenu';
+import ModelUpdateBanner from './ModelUpdateBanner';
+import { needsUpdate } from '../../utils/modelUpdate';
+import { space } from '../../constants/design-system';
+import ModelSelectSheet from '../bottomSheets/ModelSelectSheet';
+import { Theme } from '../../styles/colors';
+import { useSQLiteContext } from 'expo-sqlite';
+import { useVectorStore } from '../../context/VectorStoreContext';
+import { WEB_SEARCH_ENABLED } from '../../constants/web';
+import { useLegacyChatNotice } from '../../hooks/useLegacyChatNotice';
+import useChatSettings from '../../hooks/useChatSettings';
+import { setLastUsedModelId } from '../../utils/lastUsedModel';
+import useChatBranching from '../../hooks/useChatBranching';
+import { useStableCallback } from '../../hooks/useStableCallback';
+import { useBackToDismiss } from '../../hooks/useBackToDismiss';
+import {
+  LAYOUT_HEIGHT_CHANGE_THRESHOLD,
+  NEW_CHAT_HEADING,
+} from '../../constants/chat-screen';
+import { retryWithPinnedModel } from './loadModelPinnedToChat';
+import { useMemoryStallCard } from './useMemoryStallCard';
+import { startPhantomChat } from '../../utils/startPhantomChat';
+import { CHAT_ENTRY_ACTION } from '../../constants/chat-route-params';
+
+interface Props {
+  chatId: number;
+  chat: Chat | undefined;
+  messageHistory: Message[];
+  isLoading?: boolean;
+  model: Model | undefined;
+  selectModel?: (model: Model) => Promise<void>;
+  revealFromTop?: boolean;
+  headerTitleBottom?: number;
+  opensModelSheet?: boolean;
+}
+
+export default function ChatScreen({
+  chatId,
+  chat,
+  messageHistory,
+  isLoading = false,
+  model,
+  selectModel,
+  revealFromTop = false,
+  headerTitleBottom,
+  opensModelSheet = false,
+}: Props) {
+  const inputRef = useRef<{
+    setInput: (text: string) => void;
+  }>(null);
+  const messagesRef = useRef<MessagesHandle>(null);
+  const modelBottomSheetModalRef = useRef<BottomSheetModal>(null);
+  const db = useSQLiteContext();
+
+  const { vectorStore, embeddings } = useVectorStore();
+  const isModelLoading = useLLMStore((state) => state.isLoading);
+  const isGenerating = useLLMStore((state) => state.isGenerating);
+  const loadModel = useLLMStore((state) => state.loadModel);
+  const generationError = useLLMStore((state) => state.generationError);
+  const retryLastGeneration = useLLMStore((state) => state.retryLastGeneration);
+  const retryArmedForChatId = useLLMStore((state) => state.retryArmedForChatId);
+  const { setChatModel, phantomChat } = useChatStore();
+  const phantomChatOpens = useChatStore((state) => state.phantomChatOpens);
+  const isPhantomChat = phantomChat?.id === chatId && !chat;
+
+  const { styles, theme } = useThemedStyles(createStyles);
+  const headerHeight = useHeaderHeight();
+
+  const keyboardLift = useKeyboardLift();
+  const chatBarStickyStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: keyboardLift.value }],
+  }));
+
+  const { settings: chatSettings, setSetting } = useChatSettings(chatId);
+
+  const enabledSources =
+    chat?.enabledSources || phantomChat?.enabledSources || [];
+
+  // Shared values for KeyboardChatScrollView
+  const extraContentPadding = useSharedValue(0);
+  const [chatBarHeight, setChatBarHeight] = useState(0);
+
+  useEffect(() => {
+    extraContentPadding.set(0);
+  }, [model?.id, extraContentPadding]);
+
+  const isEmpty = !isLoading && messageHistory.length === 0;
+  const hasMessages = isLoading || messageHistory.length > 0;
+
+  const {
+    rootRef,
+    rootFrame,
+    handleRootLayout,
+    userActionMenu,
+    setUserActionMenu,
+    userActionMenuPosition,
+    gradientStyle,
+    topFadeStyle,
+    showGradient,
+    fadeBottom,
+    topFadeAnchor,
+  } = useChatScreenLayout({ isEmpty, headerTitleBottom, headerHeight });
+  const chatBarTopClearance = Math.max(
+    headerHeight,
+    topFadeHeight(topFadeAnchor)
+  );
+  useBackToDismiss(userActionMenu.isOpen, () =>
+    setUserActionMenu({ isOpen: false })
+  );
+
+  const { branchMarkers, handleForkMessage, handleBranchMarkerPress } =
+    useChatBranching({
+      chatId,
+      messageHistoryLength: messageHistory.length,
+    });
+  const [speechInputOpen, setSpeechInputOpen] = useState(false);
+  const [whatsNewOpen, setWhatsNewOpen] = useState(false);
+  const barHeight = useSharedValue(0);
+  const handleBarLayout = useCallback(
+    (event: LayoutChangeEvent) => {
+      barHeight.set(event.nativeEvent.layout.height);
+    },
+    [barHeight]
+  );
+
+  const handleBarGrow = useCallback(() => {
+    setTimeout(() => {
+      messagesRef.current?.scrollToEndIfAtBottom();
+    }, 100);
+  }, []);
+
+  // Freeze the scroll view's layout whenever any overlay (model picker,
+  // attachment sheet) is presented so keyboard dismiss → sheet open doesn't
+  // cause an intermediate content jump.
+  const [modelSheetOpen, setModelSheetOpen] = useState(false);
+  const [attachmentSheetOpen, setAttachmentSheetOpen] = useState(false);
+  const overlayOpen = modelSheetOpen || attachmentSheetOpen;
+
+  useEffect(() => {
+    setModelSheetOpen(false);
+    setAttachmentSheetOpen(false);
+  }, [model?.id]);
+
+  const handlePresentModelSheet = useCallback(() => {
+    Keyboard.dismiss();
+    setUserActionMenu({ isOpen: false });
+    modelBottomSheetModalRef.current?.present();
+  }, [setUserActionMenu]);
+
+  const handleChatBarHeightChange = useCallback((height: number) => {
+    setChatBarHeight((current) =>
+      Math.abs(current - height) > LAYOUT_HEIGHT_CHANGE_THRESHOLD
+        ? height
+        : current
+    );
+  }, []);
+
+  const handleSelectModel = async (selectedModel: Model) => {
+    try {
+      await loadModel(selectedModel);
+      if (useLLMStore.getState().model?.id !== selectedModel.id) {
+        throw new Error(`Model ${selectedModel.id} did not finish loading`);
+      }
+
+      if (chatId && !model) {
+        await setChatModel(chatId, selectedModel.id);
+      }
+
+      await setLastUsedModelId(selectedModel.id);
+      await selectModel?.(selectedModel);
+      return true;
+    } catch (error) {
+      console.error('Error loading model:', error);
+      return false;
+    }
+  };
+
+  const {
+    pendingModel,
+    isSwitching,
+    pickModel,
+    handleSheetStateChange: handleModelSwitchSheetState,
+    whenSettled: whenModelSwitchSettles,
+  } = useModelSwitch(handleSelectModel);
+
+  const answeringModel = pendingModel ?? model;
+
+  const handleModelPicked = useCallback(
+    (picked: Model) => {
+      if (picked.id !== model?.id) pickModel(picked);
+    },
+    [model?.id, pickModel]
+  );
+
+  const presentedSheetOnEntry = useRef(false);
+  useEffect(() => {
+    if (!opensModelSheet || presentedSheetOnEntry.current) return;
+    presentedSheetOnEntry.current = true;
+    handlePresentModelSheet();
+  }, [opensModelSheet, handlePresentModelSheet]);
+
+  const handleModelSheetStateChange = useCallback(
+    (isOpen: boolean) => {
+      setModelSheetOpen(isOpen);
+      handleModelSwitchSheetState(isOpen);
+    },
+    [handleModelSwitchSheetState]
+  );
+
+  const sendChatMessage = useSendChatMessage({
+    chatId,
+    model,
+    messageHistory,
+    chatSettings,
+    enabledSources,
+    vectorStore,
+    embeddings,
+    messagesRef,
+    db,
+    isGenerating,
+    isModelLoading,
+    isSwitching,
+    waitForModelSwitch: whenModelSwitchSettles,
+  });
+  const handleSendMessage = useStableCallback(sendChatMessage);
+
+  const {
+    handleThinkingToggle,
+    thinkingEnabled,
+    handleWebSearchToggle,
+    handleSelectPrompt,
+    webSearchEnabled,
+  } = useChatScreenActions({
+    chatId,
+    chat,
+    model,
+    chatSettings,
+    setSetting,
+    db,
+    inputRef,
+    modelSwitching: isSwitching,
+  });
+
+  const chatGenerationError =
+    generationError?.chatId === chatId ? generationError.message : undefined;
+
+  const handleRetryGeneration = useCallback(() => {
+    messagesRef.current?.onMessageSent();
+    retryWithPinnedModel(
+      isSwitching ? undefined : model,
+      retryLastGeneration
+    ).catch((error) => {
+      console.error('Failed to retry generation:', error);
+    });
+  }, [model, retryLastGeneration, isSwitching]);
+
+  const handleNewChatWithAnotherModel = useCallback(() => {
+    startPhantomChat(db, 'push', undefined, CHAT_ENTRY_ACTION.PickModel).catch(
+      (error) => {
+        console.error('Failed to open a new chat for another model:', error);
+      }
+    );
+  }, [db]);
+
+  const memoryStallCard = useMemoryStallCard({
+    chatId,
+    model,
+    busy: isModelLoading || isSwitching,
+    startNewChat: handleNewChatWithAnotherModel,
+    retryWithChatModel: handleRetryGeneration,
+  });
+
+  const scrollBottomOffset = theme.insets.bottom;
+  const showUpdateBanner = hasMessages && !!model && needsUpdate(model);
+  const [updateBannerHeight, setUpdateBannerHeight] = useState(0);
+  const handleUpdateBannerLayout = useCallback(
+    (e: { nativeEvent: { layout: { height: number } } }) =>
+      setUpdateBannerHeight(e.nativeEvent.layout.height + space.two),
+    []
+  );
+  const messagesTopInset =
+    headerHeight + (showUpdateBanner ? updateBannerHeight : 0);
+
+  useLegacyChatNotice(messageHistory);
+
+  const showHero =
+    isEmpty &&
+    !!model?.isDownloaded &&
+    !speechInputOpen &&
+    rootFrame.height > 0;
+  const isFocused = useIsFocused();
+  const playSwarm = useSwarmOncePerNewChat(
+    showHero && isFocused,
+    phantomChatOpens
+  );
+  const heading = useHeadingAnchor(rootRef, rootFrame.height);
+  const heroOpacityBeforeSwarm = useReducedMotion() ? 1 : 0;
+  const headingReveal = useSharedValue(heroOpacityBeforeSwarm);
+  const badgeReveal = useSharedValue(heroOpacityBeforeSwarm);
+
+  return (
+    <View
+      ref={rootRef}
+      style={styles.container}
+      collapsable={false}
+      onLayout={handleRootLayout}
+    >
+      {showGradient && (
+        <Animated.View
+          style={[StyleSheet.absoluteFill, gradientStyle]}
+          pointerEvents="none"
+        >
+          <NewChatBackground />
+        </Animated.View>
+      )}
+      {playSwarm && (
+        <NewChatSwarm
+          key={phantomChatOpens}
+          screenHeight={rootFrame.height}
+          headingClearance={SWARM_CLEARANCE_WITH_PROMPTS}
+          keyboardLift={keyboardLift}
+          heading={NEW_CHAT_HEADING}
+          headingAnchor={heading.anchor}
+          headingReveal={headingReveal}
+          badgeReveal={badgeReveal}
+        />
+      )}
+      <View style={styles.messagesLayer} pointerEvents="box-none">
+        <Messages
+          ref={messagesRef}
+          chatHistory={messageHistory}
+          extraContentPadding={extraContentPadding}
+          isGenerating={isGenerating}
+          generationError={chatGenerationError}
+          onRetryGeneration={handleRetryGeneration}
+          canRetryGeneration={retryArmedForChatId === chatId}
+          turnFooter={memoryStallCard}
+          bottomOffset={scrollBottomOffset}
+          freeze={overlayOpen}
+          revealFromTop={revealFromTop}
+          branchMarkers={branchMarkers}
+          onForkMessage={handleForkMessage}
+          onBranchMarkerPress={handleBranchMarkerPress}
+          onUserActionMenuChange={setUserActionMenu}
+          chatBarInset={chatBarHeight}
+          topInset={messagesTopInset}
+          fadeBottom={fadeBottom}
+        />
+      </View>
+
+      {showHero && (
+        <NewChatHero
+          screenHeight={rootFrame.height}
+          barHeight={barHeight}
+          keyboardLift={keyboardLift}
+          onWhatsNewOpenChange={setWhatsNewOpen}
+          headingRef={heading.textRef}
+          onHeadingLayout={heading.onTextLayout}
+          headingReveal={headingReveal}
+          badgeReveal={badgeReveal}
+        />
+      )}
+
+      <Animated.View
+        onLayout={handleBarLayout}
+        style={[
+          styles.chatBarSticky,
+          rootFrame.height > 0 && {
+            maxHeight: rootFrame.height - chatBarTopClearance,
+          },
+          chatBarStickyStyle,
+        ]}
+      >
+        <ChatBar
+          chatId={chatId}
+          onSend={handleSendMessage}
+          onSelectModel={handlePresentModelSheet}
+          modelLocked={!isPhantomChat}
+          onSelectPrompt={handleSelectPrompt}
+          ref={inputRef}
+          model={model}
+          pendingModel={pendingModel}
+          isVisionModel={answeringModel?.vision === true}
+          extraContentPadding={extraContentPadding}
+          thinkingEnabled={thinkingEnabled}
+          onThinkingToggle={handleThinkingToggle}
+          webSearchEnabled={webSearchEnabled}
+          onWebSearchToggle={
+            WEB_SEARCH_ENABLED ? handleWebSearchToggle : undefined
+          }
+          hasMessages={hasMessages}
+          disabled={isModelLoading && !isSwitching}
+          modelSwitching={isSwitching}
+          onAttachmentSheetStateChange={setAttachmentSheetOpen}
+          onHeightChange={handleChatBarHeightChange}
+          onBarGrow={handleBarGrow}
+          onSpeechInputChange={setSpeechInputOpen}
+          promptsPaused={overlayOpen || whatsNewOpen || !isPhantomChat}
+        />
+      </Animated.View>
+
+      {showGradient && !isEmpty && (
+        <Animated.View
+          style={[
+            styles.topFadeOverlay,
+            { height: topFadeHeight(topFadeAnchor) },
+            topFadeStyle,
+          ]}
+          pointerEvents="none"
+        >
+          <TopFade
+            anchor={topFadeAnchor}
+            backdrop={<NewChatBackground />}
+            backdropHeight={rootFrame.height}
+          />
+        </Animated.View>
+      )}
+
+      {showUpdateBanner && model && (
+        <Animated.View
+          entering={FadeInUp}
+          exiting={FadeOutUp}
+          style={[
+            styles.updateBannerOverlay,
+            { top: headerHeight + space.two },
+          ]}
+          pointerEvents="box-none"
+          onLayout={handleUpdateBannerLayout}
+        >
+          <ModelUpdateBanner model={model} />
+        </Animated.View>
+      )}
+
+      {userActionMenuPosition && (
+        <View
+          style={[styles.userActionMenuOverlay, userActionMenuPosition]}
+          pointerEvents="box-none"
+        >
+          <UserMessageActionMenu onCopy={userActionMenu.onCopy} />
+        </View>
+      )}
+
+      <ModelSelectSheet
+        bottomSheetModalRef={modelBottomSheetModalRef}
+        onModelPicked={handleModelPicked}
+        onSheetStateChange={handleModelSheetStateChange}
+        currentModelId={model?.id}
+      />
+    </View>
+  );
+}
+
+const createStyles = (theme: Theme) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.bg.softPrimary,
+    },
+    messagesLayer: {
+      flex: 1,
+      zIndex: 1,
+      elevation: 1,
+      overflow: 'visible',
+    },
+    updateBannerOverlay: {
+      position: 'absolute',
+      left: 0,
+      right: 0,
+      alignItems: 'center',
+      zIndex: 4,
+      elevation: 4,
+    },
+    userActionMenuOverlay: {
+      position: 'absolute',
+      zIndex: 1000,
+      elevation: 1000,
+    },
+    topFadeOverlay: {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      right: 0,
+      zIndex: 3,
+      elevation: 3,
+    },
+    chatBarSticky: {
+      position: 'absolute',
+      bottom: 0,
+      left: 0,
+      right: 0,
+      zIndex: 2,
+      elevation: 2,
+    },
+  });

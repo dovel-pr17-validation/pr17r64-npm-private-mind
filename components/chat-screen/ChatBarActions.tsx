@@ -1,0 +1,233 @@
+import React from 'react';
+import { View, StyleSheet } from 'react-native';
+import Animated, {
+  Extrapolation,
+  interpolate,
+  useAnimatedStyle,
+  type SharedValue,
+} from 'react-native-reanimated';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import CircleButton from '../CircleButton';
+import ComposerActionButton, {
+  type ComposerAction,
+} from './ComposerActionButton';
+import SoundwaveIcon from '../../assets/icons/soundwave.svg';
+import PlusIcon from '../../assets/icons/plus.svg';
+import LightBulbIcon from '../../assets/icons/light_bulb.svg';
+import WebIcon from '../../assets/icons/web.svg';
+import ComposerToolChip from './ComposerToolChip';
+import ComposerModelBadge from './ComposerModelBadge';
+import { composerControlColors } from './composerControl';
+import { Model } from '../../database/modelRepository';
+import { Feedback } from '../../utils/Feedback';
+import Toast from 'react-native-toast-message';
+import { COMPOSER } from './attachments/constants';
+import {
+  usePrimaryActionGuard,
+  type PrimaryAction,
+} from './usePrimaryActionGuard';
+import { dimmedOpacity } from '../../styles/pressable';
+import { space } from '../../constants/design-system';
+
+const composerAction = (
+  isResponding: boolean,
+  canSend: boolean
+): ComposerAction => {
+  if (isResponding) return 'stop';
+  if (canSend) return 'send';
+  return 'speech';
+};
+
+const ACTION_TEST_IDS: Record<ComposerAction, string> = {
+  send: 'send-btn',
+  stop: 'stop-btn',
+  speech: 'speech-btn',
+};
+
+interface Props {
+  onAttach: () => void;
+  onAttachPressIn?: () => void;
+  onAttachPressOut?: () => void;
+  userInput: string;
+  hasAttachments?: boolean;
+  isLoadingAttachment?: boolean;
+  sendPending?: boolean;
+  sendInFlight?: boolean;
+  onSend: () => void;
+  isGenerating: boolean;
+  isProcessingPrompt: boolean;
+  onInterrupt: () => void;
+  onSpeechInput: () => void;
+  plusOut: SharedValue<number>;
+  model?: Model;
+  pendingModel?: Model;
+  onSelectModel: () => void;
+  modelLocked?: boolean;
+  thinkingEnabled?: boolean;
+  onThinkingToggle?: () => void;
+  webSearchEnabled?: boolean;
+  onWebSearchToggle?: () => void;
+}
+
+const ChatBarActions = ({
+  onAttach,
+  onAttachPressIn,
+  onAttachPressOut,
+  userInput,
+  hasAttachments = false,
+  isLoadingAttachment = false,
+  sendPending = false,
+  sendInFlight = false,
+  onSend,
+  isGenerating,
+  isProcessingPrompt,
+  onInterrupt,
+  onSpeechInput,
+  plusOut,
+  model,
+  pendingModel,
+  onSelectModel,
+  modelLocked = false,
+  thinkingEnabled = false,
+  onThinkingToggle,
+  webSearchEnabled = false,
+  onWebSearchToggle,
+}: Props) => {
+  const { styles, theme } = useThemedStyles(createStyles);
+  const plusStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(plusOut.get(), [0, 0.75], [1, 0], Extrapolation.CLAMP),
+    transform: [{ translateX: plusOut.get() * COMPOSER.plusSlide }],
+  }));
+  const isResponding = isGenerating || isProcessingPrompt;
+  const hasComposedInput = !!userInput || hasAttachments;
+  const isSendable = hasComposedInput;
+  const action = composerAction(
+    isResponding,
+    Boolean(sendPending || sendInFlight || isSendable)
+  );
+  const guardedAction: PrimaryAction = action === 'speech' ? 'voice' : action;
+  const guardPrimaryPress = usePrimaryActionGuard(guardedAction);
+
+  const handleAttach = () => {
+    if (isLoadingAttachment) {
+      Toast.show({
+        type: 'defaultToast',
+        text1: 'Wait for the document to finish processing.',
+      });
+      return;
+    }
+
+    Feedback.sheetOpen();
+    onAttach();
+  };
+
+  const renderButton = () => {
+    const handlePress = () =>
+      guardPrimaryPress(() => {
+        if (action === 'stop') {
+          Feedback.interrupt();
+          onInterrupt();
+          return;
+        }
+        if (action === 'send') {
+          Feedback.send();
+          onSend();
+          return;
+        }
+        onSpeechInput();
+      });
+
+    return (
+      <View style={styles.rightActions}>
+        {action === 'send' && hasAttachments && !userInput && !sendPending && (
+          <CircleButton
+            icon={SoundwaveIcon}
+            onPress={onSpeechInput}
+            {...composerControlColors(theme)}
+            color={theme.text.onChatBar}
+          />
+        )}
+        <ComposerActionButton
+          action={action}
+          onPress={handlePress}
+          busy={action === 'send' && sendPending}
+          disabled={action === 'send' && (sendPending || isLoadingAttachment)}
+          testID={ACTION_TEST_IDS[action]}
+        />
+      </View>
+    );
+  };
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.leftActions}>
+        <View
+          testID="attach-btn-container"
+          style={isLoadingAttachment ? dimmedOpacity : undefined}
+        >
+          <Animated.View style={plusStyle}>
+            <CircleButton
+              icon={PlusIcon}
+              size={16}
+              onPress={handleAttach}
+              onPressIn={onAttachPressIn}
+              onPressOut={onAttachPressOut}
+              {...composerControlColors(theme)}
+              color={theme.text.onChatBar}
+              testID="attach-btn"
+            />
+          </Animated.View>
+        </View>
+        {model && (
+          <ComposerModelBadge
+            model={pendingModel ?? model}
+            loading={!!pendingModel}
+            onPress={onSelectModel}
+            locked={modelLocked}
+          />
+        )}
+        {thinkingEnabled && onThinkingToggle ? (
+          <ComposerToolChip
+            label="Think"
+            icon={LightBulbIcon}
+            onTurnOff={onThinkingToggle}
+            testID="tool-chip-think"
+          />
+        ) : null}
+        {webSearchEnabled && onWebSearchToggle ? (
+          <ComposerToolChip
+            label="Web search"
+            icon={WebIcon}
+            onTurnOff={onWebSearchToggle}
+            testID="tool-chip-web"
+          />
+        ) : null}
+      </View>
+
+      {renderButton()}
+    </View>
+  );
+};
+
+export default ChatBarActions;
+
+const createStyles = () =>
+  StyleSheet.create({
+    container: {
+      flexDirection: 'row',
+      width: '100%',
+      justifyContent: 'space-between',
+      gap: space.two,
+    },
+    leftActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      flexShrink: 1,
+      gap: space.one,
+    },
+    rightActions: {
+      flexDirection: 'row',
+      gap: space.two,
+      alignItems: 'center',
+    },
+  });

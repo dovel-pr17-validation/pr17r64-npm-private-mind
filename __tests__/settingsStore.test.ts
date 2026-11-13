@@ -1,0 +1,60 @@
+import { useSettingsStore } from '../store/settingsStore';
+import { MAX_CUSTOM_SYSTEM_PROMPT_LENGTH } from '../constants/settings';
+
+describe('useSettingsStore', () => {
+  beforeEach(() => {
+    useSettingsStore.setState({
+      customSystemPrompt: '',
+      showPerformanceMetrics: false,
+      themePreference: 'system',
+    });
+  });
+
+  it('follows the system theme until the user picks one', () => {
+    expect(useSettingsStore.getState().themePreference).toBe('system');
+    useSettingsStore.getState().setThemePreference('dark');
+    expect(useSettingsStore.getState().themePreference).toBe('dark');
+  });
+
+  it('defaults to an empty custom system prompt', () => {
+    expect(useSettingsStore.getState().customSystemPrompt).toBe('');
+  });
+
+  it('stores a custom system prompt', () => {
+    useSettingsStore.getState().setCustomSystemPrompt('Be concise.');
+    expect(useSettingsStore.getState().customSystemPrompt).toBe('Be concise.');
+  });
+
+  it('trims surrounding whitespace', () => {
+    useSettingsStore.getState().setCustomSystemPrompt('  Be concise.  ');
+    expect(useSettingsStore.getState().customSystemPrompt).toBe('Be concise.');
+  });
+
+  it('clamps a prompt longer than the limit', () => {
+    const tooLong = 'a'.repeat(MAX_CUSTOM_SYSTEM_PROMPT_LENGTH + 50);
+    useSettingsStore.getState().setCustomSystemPrompt(tooLong);
+    expect(useSettingsStore.getState().customSystemPrompt).toHaveLength(
+      MAX_CUSTOM_SYSTEM_PROMPT_LENGTH
+    );
+  });
+
+  it('keeps a prompt at exactly the limit intact', () => {
+    const exact = 'a'.repeat(MAX_CUSTOM_SYSTEM_PROMPT_LENGTH);
+    useSettingsStore.getState().setCustomSystemPrompt(exact);
+    expect(useSettingsStore.getState().customSystemPrompt).toBe(exact);
+  });
+
+  it('hides performance metrics by default', () => {
+    expect(useSettingsStore.getInitialState().showPerformanceMetrics).toBe(
+      false
+    );
+  });
+
+  it('toggles performance metrics on and off', () => {
+    useSettingsStore.getState().setShowPerformanceMetrics(true);
+    expect(useSettingsStore.getState().showPerformanceMetrics).toBe(true);
+
+    useSettingsStore.getState().setShowPerformanceMetrics(false);
+    expect(useSettingsStore.getState().showPerformanceMetrics).toBe(false);
+  });
+});

@@ -1,0 +1,439 @@
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { AppState, StyleSheet, Text, View } from 'react-native';
+import { Theme } from '../../styles/colors';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import { fontSizes, lineHeights } from '../../styles/fontStyles';
+import { useSpeechInput, type Status } from '../../hooks/useSpeechInput';
+import CircleButton from '../CircleButton';
+import StopIcon from '../../assets/icons/pause_icon.svg';
+import SendIcon from '../../assets/icons/send_icon.svg';
+import RecordingAnimation from './RecordingAnimation';
+import Animated, {
+  interpolateColor,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
+import { ScrollView } from 'react-native-gesture-handler';
+import Toast from 'react-native-toast-message';
+import {
+  isOutOfSpaceError,
+  shortfallBehind,
+  showNotEnoughStorage,
+} from '../../utils/storageSpace';
+import { WHISPER_DOWNLOAD_SIZE_BYTES } from '../../utils/sttModelFiles';
+import { useStableCallback } from '../../hooks/useStableCallback';
+import { DIMMED_OPACITY, dimmedOpacity } from '../../styles/pressable';
+import { radius, space } from '../../constants/design-system';
+import { withoutNonSpeechNotes } from '../../utils/whisperTranscript';
+import { COMPOSER_CARD_RADIUS } from './attachments/constants';
+
+interface Props {
+  onSubmit: (text: string) => void;
+  onCancel: () => void;
+  onInterrupted?: (heard: string) => void;
+}
+
+const CANCEL_ANIMATION_DURATION = 500;
+
+type Phase = Status | 'ended';
+
+const ACTION_NOTES: Record<Phase, string> = {
+  loading: 'Loading speech recognition...',
+  idle: 'Loading speech recognition...',
+  processing: 'Finishing the transcript...',
+  listening: 'Click again to send',
+  ended: 'Dictation stopped',
+};
+
+const shownTranscript = (committed: string, nonCommitted: string) =>
+  withoutNonSpeechNotes(committed + ' ' + nonCommitted);
+
+const ChatSpeechInput: React.FC<Props> = ({
+  onSubmit: onSubmitProp,
+  onCancel: onCancelProp,
+  onInterrupted: onInterruptedProp,
+}) => {
+  const { styles, theme } = useThemedStyles(createStyles);
+
+  const recordingAttemptedRef = useRef(false);
+  const recordingStartTimeRef = useRef(0);
+  /** in seconds */
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [transcription, setTranscription] = useState<{
+    committed: string;
+    nonCommitted: string;
+  }>({ committed: '', nonCommitted: '' });
+
+  const heardSoFarRef = useRef({ committed: '', nonCommitted: '' });
+
+  const animationRef =
+    useRef<React.ComponentRef<typeof RecordingAnimation>>(null);
+  const exitStateRef = useRef<
+    null | 'pending_submit' | 'pending_cancel' | 'exited'
+  >(null);
+
+  const onSubmit = useStableCallback((result: string) => {
+    if (exitStateRef.current === 'exited') return;
+    exitStateRef.current = 'exited';
+    onSubmitProp(result);
+  });
+  const onCancel = useStableCallback(() => {
+    if (exitStateRef.current === 'exited') return;
+    exitStateRef.current = 'exited';
+    onCancelProp();
+  });
+
+  const { loadProgress, isDownloading, status, start, stop, abandon } =
+    useSpeechInput({
+      onAudioData: (data) => {
+        setRecordingDuration(
+          Math.floor((Date.now() - recordingStartTimeRef.current) / 1000)
+        );
+        animationRef.current?.pushChunk(data);
+      },
+    });
+
+  const [hasStarted, setHasStarted] = useState(false);
+  const unmountedRef = useRef(false);
+  const abandonRef = useRef(abandon);
+  abandonRef.current = abandon;
+  useEffect(() => {
+    const startListening = async () => {
+      try {
+        const streamGenerator = await start();
+        if (!streamGenerator) {
+          if (!unmountedRef.current) onCancel();
+          return;
+        }
+
+        recordingStartTimeRef.current = Date.now();
+        let text = '';
+        let pendingText = '';
+        for await (const { committed, nonCommitted } of streamGenerator) {
+          if (unmountedRef.current) break;
+          text = committed;
+          pendingText = nonCommitted;
+          heardSoFarRef.current = {
+            committed: text,
+            nonCommitted: pendingText,
+          };
+          setTranscription(heardSoFarRef.current);
+        }
+
+        if (unmountedRef.current) return;
+
+        if (exitStateRef.current === 'pending_submit') {
+          const shown = shownTranscript(text, pendingText);
+          if (shown) {
+            onSubmit(shown);
+          } else {
+            Toast.show({ type: 'defaultToast', text1: 'No speech was heard.' });
+            onCancel();
+          }
+        } else if (exitStateRef.current === null) {
+          onEndedEarly(shownTranscript(text, pendingText));
+        }
+      } catch (error) {
+        if (unmountedRef.current) return;
+        if (isOutOfSpaceError(error)) {
+          showNotEnoughStorage(
+            'Voice dictation',
+            shortfallBehind(error, WHISPER_DOWNLOAD_SIZE_BYTES)
+          );
+        } else {
+          Toast.show({
+            type: 'defaultToast',
+            text1: 'Could not start live transcript',
+          });
+        }
+        onCancel();
+        return;
+      }
+    };
+
+    if (!recordingAttemptedRef.current) {
+      recordingAttemptedRef.current = true;
+      setHasStarted(true);
+      startListening();
+    }
+
+    return () => {
+      unmountedRef.current = true;
+      abandonRef.current();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const onInterrupted = useStableCallback((heard: string) => {
+    if (onInterruptedProp) onInterruptedProp(heard);
+    else onCancelProp();
+  });
+  const onEndedEarly = useStableCallback((heard: string) => {
+    if (heard) {
+      exitStateRef.current = 'exited';
+      onInterrupted(heard);
+      return;
+    }
+    onCancel();
+  });
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'background' || exitStateRef.current !== null) return;
+      exitStateRef.current = 'exited';
+      const { committed, nonCommitted } = heardSoFarRef.current;
+      abandonRef.current();
+      onInterrupted(shownTranscript(committed, nonCommitted));
+    });
+    return () => subscription.remove();
+  }, [onInterrupted]);
+
+  const animationWrapperRef = useRef<View | null>(null);
+  const [animationWidth, setAnimationWidth] = useState(0);
+
+  useLayoutEffect(() => {
+    if (animationWrapperRef.current) {
+      animationWrapperRef.current.measure((x, y, width) => {
+        setAnimationWidth(Math.floor(width));
+      });
+    }
+  }, []);
+
+  const cancelAnimationProgress = useSharedValue(0);
+  const wrapperStyle = useAnimatedStyle(() => {
+    return {
+      backgroundColor: interpolateColor(
+        cancelAnimationProgress.get(),
+        [0, 0.5, 1],
+        [theme.bg.main, theme.bg.errorPrimary, theme.bg.errorPrimary]
+      ),
+    };
+  });
+
+  const handleCancel = () => {
+    if (exitStateRef.current === null) exitStateRef.current = 'pending_cancel';
+    stop();
+    cancelAnimationProgress.set(
+      withTiming(1, {
+        duration: CANCEL_ANIMATION_DURATION,
+      })
+    );
+
+    setTimeout(onCancel, CANCEL_ANIMATION_DURATION);
+  };
+
+  const [sending, setSending] = useState(false);
+  const phase: Phase = hasStarted && status === 'idle' ? 'ended' : status;
+  const isPreparing = phase === 'loading' || phase === 'idle';
+
+  const handleSend = async () => {
+    if (isPreparing) {
+      Toast.show({
+        type: 'defaultToast',
+        text1: 'Still loading speech recognition, one moment.',
+      });
+      return;
+    }
+    if (phase !== 'listening' || sending) return;
+
+    exitStateRef.current = 'pending_submit';
+    setSending(true);
+    if (await stop()) return;
+    exitStateRef.current = null;
+    setSending(false);
+  };
+
+  const actionNote = ACTION_NOTES[phase];
+
+  const renderTopNote = () => {
+    const fullTranscription = shownTranscript(
+      transcription.committed,
+      transcription.nonCommitted
+    );
+
+    if (fullTranscription) {
+      return <ScrollableTranscript text={fullTranscription} />;
+    }
+
+    if (status === 'listening') {
+      return (
+        <Text style={styles.secondaryNote}>
+          Start talking to see the live transcript...
+        </Text>
+      );
+    }
+
+    if (status === 'processing') {
+      return <Text style={styles.secondaryNote}>Processing...</Text>;
+    }
+
+    if (phase === 'ended') return null;
+
+    const progressPercentage = Math.round(loadProgress * 100);
+    if (status === 'loading' && isDownloading) {
+      return (
+        <Text style={styles.secondaryNote}>
+          Downloading the dictation model ({progressPercentage}%)
+        </Text>
+      );
+    }
+    return (
+      <Text style={styles.secondaryNote}>
+        Loading...{status === 'loading' ? ` (${progressPercentage}%)` : ''}
+      </Text>
+    );
+  };
+
+  return (
+    <Animated.View style={[styles.container, wrapperStyle]}>
+      {renderTopNote()}
+
+      <View style={styles.recordingRow}>
+        <RecordingInfo
+          active={status === 'listening'}
+          duration={recordingDuration}
+        />
+        <View
+          ref={animationWrapperRef}
+          style={styles.recordingAnimationWrapper}
+        >
+          {animationWidth > 0 && (
+            <RecordingAnimation
+              ref={animationRef}
+              width={animationWidth}
+              height={24}
+            />
+          )}
+        </View>
+      </View>
+
+      <View style={styles.actionRow}>
+        <CircleButton
+          icon={StopIcon}
+          onPress={handleCancel}
+          size={14}
+          color={theme.text.contrastPrimary}
+          backgroundColor={theme.bg.voiceModeSurface}
+          testID="speech-cancel"
+        />
+        <Text style={[styles.secondaryNote, styles.actionNote]}>
+          {actionNote}
+        </Text>
+        <View
+          style={status === 'listening' || sending ? undefined : dimmedOpacity}
+        >
+          <CircleButton
+            icon={SendIcon}
+            onPress={handleSend}
+            busy={sending}
+            disabled={sending}
+            color={theme.text.primary}
+            backgroundColor={theme.bg.softPrimary}
+            testID="speech-send"
+          />
+        </View>
+      </View>
+    </Animated.View>
+  );
+};
+
+export default ChatSpeechInput;
+
+const RecordingInfo: React.FC<{
+  active: boolean;
+  /** in seconds */
+  duration: number;
+}> = ({ active, duration }) => {
+  const { styles } = useThemedStyles(createStyles);
+
+  const minutes = Math.floor(duration / 60);
+  const seconds = duration % 60;
+
+  return (
+    <View style={styles.recordingInfo}>
+      <View style={[styles.recordingDot, !active && styles.recordingDotOff]} />
+      <Text style={styles.note}>
+        {minutes}:{seconds.toString().padStart(2, '0')}
+      </Text>
+    </View>
+  );
+};
+
+const ScrollableTranscript: React.FC<{ text: string }> = ({ text }) => {
+  const { styles } = useThemedStyles(createStyles);
+
+  return (
+    <ScrollView style={styles.transcriptWrapper}>
+      <View style={styles.transcriptContent}>
+        <Text style={styles.note}>{text}</Text>
+      </View>
+    </ScrollView>
+  );
+};
+
+const createStyles = (theme: Theme) =>
+  StyleSheet.create({
+    container: {
+      backgroundColor: theme.bg.main,
+      borderRadius: COMPOSER_CARD_RADIUS,
+      padding: space.four,
+      gap: space.four,
+    },
+
+    note: {
+      fontSize: fontSizes.xs,
+      lineHeight: lineHeights.xs,
+      color: theme.text.contrastPrimary,
+    },
+    secondaryNote: {
+      fontSize: fontSizes.xs,
+      lineHeight: lineHeights.xs,
+      color: theme.text.contrastTertiary,
+    },
+
+    recordingRow: {
+      backgroundColor: theme.bg.voiceModeSurface,
+      height: 40,
+      borderRadius: radius.full,
+      flexDirection: 'row',
+      paddingHorizontal: space.three,
+      paddingVertical: space.two,
+      gap: space.two,
+    },
+    recordingInfo: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+    },
+    recordingDot: {
+      width: 6,
+      height: 6,
+      borderRadius: 3,
+      backgroundColor: theme.bg.errorPrimary,
+    },
+    recordingDotOff: {
+      backgroundColor: theme.text.contrastPrimary,
+      opacity: DIMMED_OPACITY,
+    },
+    recordingAnimationWrapper: {
+      flex: 1,
+    },
+
+    actionRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.two,
+    },
+    actionNote: {
+      flex: 1,
+      textAlign: 'center',
+    },
+
+    transcriptWrapper: {
+      maxHeight: lineHeights.xs * 3,
+      transform: [{ scaleY: -1 }],
+    },
+    transcriptContent: {
+      transform: [{ scaleY: -1 }],
+    },
+  });

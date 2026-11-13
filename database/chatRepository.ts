@@ -1,0 +1,767 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { SQLiteDatabase } from 'expo-sqlite';
+import { isHttpUrl } from '../utils/web/security/outboundFetch';
+
+const DEFAULT_CHAT_SETTINGS_KEY = 'default_chat_settings';
+
+const readDefaultChatSettings = async (): Promise<ChatSettings | null> => {
+  const raw = await AsyncStorage.getItem(DEFAULT_CHAT_SETTINGS_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const settings = parsed as Partial<ChatSettings>;
+    if (typeof settings.systemPrompt !== 'string') return null;
+    return {
+      systemPrompt: settings.systemPrompt,
+      thinkingEnabled: settings.thinkingEnabled,
+    };
+  } catch {
+    return null;
+  }
+};
+
+export type Chat = {
+  id: number;
+  modelId: number;
+  title: string;
+  lastUsed: number;
+  enabledSources?: number[];
+  settings?: ChatSettings;
+};
+
+export type ChatSettings = {
+  systemPrompt: string;
+  thinkingEnabled?: boolean;
+};
+
+export type GroundingCaveatKind = 'figure' | 'trend' | 'conversion';
+
+export const MEMORY_CUT_SHORT = 'memory';
+
+export type CutShortReason = typeof MEMORY_CUT_SHORT;
+
+export type Message = {
+  id: number;
+  localId?: number;
+  chatId: number;
+  modelName?: string;
+  role: 'user' | 'assistant' | 'system' | 'event';
+  content: string;
+  imagePath?: string;
+  documentName?: string;
+  sourceDocuments?: SourceDocument[];
+  groundingCaveats?: GroundingCaveatKind[];
+  tokensPerSecond?: number;
+  timeToFirstToken?: number;
+  retrievalStats?: RetrievalStats;
+  stoppedByUser?: boolean;
+  cutShortReason?: CutShortReason;
+  timestamp: number;
+};
+
+export type RagStats = { ms: number; chunks: number };
+
+export type WebStats = {
+  ms: number;
+  sources: number;
+  read: number;
+  queries: number;
+};
+
+export type RetrievalStats = { rag?: RagStats; web?: WebStats };
+
+export type SourceKind = 'document' | 'web';
+
+export type SourceDocument = {
+  documentId?: number;
+  name: string;
+  passage?: string;
+  similarity?: number;
+  kind?: SourceKind;
+  url?: string;
+  query?: string;
+  sourceQuery?: string;
+  used?: boolean;
+  read?: boolean;
+  ordinal?: number;
+};
+
+export const sourceKind = (source: SourceDocument): SourceKind =>
+  source.kind ?? 'document';
+
+type RawMessage = Omit<
+  Message,
+  | 'sourceDocuments'
+  | 'groundingCaveats'
+  | 'retrievalStats'
+  | 'stoppedByUser'
+  | 'cutShortReason'
+> & {
+  sourceDocuments?: string | null;
+  groundingCaveats?: string | null;
+  retrievalStats?: string | null;
+  stoppedByUser?: number | null;
+  cutShortReason?: string | null;
+};
+
+const parseCutShortReason = (
+  cutShortReason?: string | null
+): CutShortReason | undefined =>
+  cutShortReason === MEMORY_CUT_SHORT ? MEMORY_CUT_SHORT : undefined;
+
+const GROUNDING_CAVEAT_KINDS: GroundingCaveatKind[] = [
+  'figure',
+  'trend',
+  'conversion',
+];
+
+const parseGroundingCaveats = (
+  groundingCaveats?: string | null
+): GroundingCaveatKind[] | undefined => {
+  if (!groundingCaveats) return undefined;
+
+  try {
+    const parsed = JSON.parse(groundingCaveats);
+    if (!Array.isArray(parsed)) return undefined;
+
+    const kinds = parsed.filter((kind): kind is GroundingCaveatKind =>
+      GROUNDING_CAVEAT_KINDS.includes(kind)
+    );
+    return kinds.length > 0 ? kinds : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const RAG_STAT_KEYS = ['ms', 'chunks'] as const;
+const WEB_STAT_KEYS = ['ms', 'sources', 'read', 'queries'] as const;
+
+const readStatCounts = <K extends string>(
+  value: unknown,
+  keys: readonly K[]
+): Record<K, number> | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  const counts = {} as Record<K, number>;
+  for (const key of keys) {
+    const count = raw[key];
+    if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) {
+      return undefined;
+    }
+    counts[key] = count;
+  }
+  return counts;
+};
+
+const parseRetrievalStats = (
+  retrievalStats?: string | null
+): RetrievalStats | undefined => {
+  if (!retrievalStats) return undefined;
+
+  try {
+    const parsed = JSON.parse(retrievalStats);
+    if (!parsed || typeof parsed !== 'object') return undefined;
+
+    const rag = readStatCounts(
+      (parsed as Record<string, unknown>).rag,
+      RAG_STAT_KEYS
+    );
+    const web = readStatCounts(
+      (parsed as Record<string, unknown>).web,
+      WEB_STAT_KEYS
+    );
+    if (!rag && !web) return undefined;
+
+    return { ...(rag ? { rag } : {}), ...(web ? { web } : {}) };
+  } catch {
+    return undefined;
+  }
+};
+
+const serializeRetrievalStats = (
+  retrievalStats?: RetrievalStats
+): string | null =>
+  retrievalStats?.rag || retrievalStats?.web
+    ? JSON.stringify(retrievalStats)
+    : null;
+
+const parseSourceDocuments = (
+  sourceDocuments?: string | null
+): SourceDocument[] | undefined => {
+  if (!sourceDocuments) return undefined;
+
+  try {
+    const parsed = JSON.parse(sourceDocuments);
+    if (!Array.isArray(parsed)) return undefined;
+
+    return parsed
+      .filter(
+        (source): source is SourceDocument =>
+          !!source &&
+          typeof source === 'object' &&
+          typeof source.name === 'string'
+      )
+      .map((source) => ({
+        documentId:
+          typeof source.documentId === 'number' ? source.documentId : undefined,
+        name: source.name,
+        passage:
+          typeof source.passage === 'string' ? source.passage : undefined,
+        similarity:
+          typeof source.similarity === 'number' ? source.similarity : undefined,
+        kind: source.kind === 'web' ? 'web' : undefined,
+        url:
+          source.kind === 'web' &&
+          typeof source.url === 'string' &&
+          isHttpUrl(source.url)
+            ? source.url
+            : undefined,
+        query:
+          source.kind === 'web' && typeof source.query === 'string'
+            ? source.query
+            : undefined,
+        sourceQuery:
+          source.kind === 'web' && typeof source.sourceQuery === 'string'
+            ? source.sourceQuery
+            : undefined,
+        used:
+          source.kind === 'web' && typeof source.used === 'boolean'
+            ? source.used
+            : undefined,
+        read:
+          source.kind === 'web' && typeof source.read === 'boolean'
+            ? source.read
+            : undefined,
+        ordinal:
+          typeof source.ordinal === 'number' ? source.ordinal : undefined,
+      }));
+  } catch {
+    return undefined;
+  }
+};
+
+export type ChatBranchMarker = {
+  id: number;
+  chatId: number;
+  afterMessageId: number;
+  sourceChatId: number;
+  sourceMessageId: number;
+  sourceChatTitle: string;
+  sourceMessagePreview: string;
+  createdAt: number | string;
+};
+
+export const createChat = async (
+  db: SQLiteDatabase,
+  title: string,
+  modelId: number,
+  modelSystemPrompt?: string | null
+): Promise<number | void> => {
+  try {
+    const result = await db.runAsync(
+      `INSERT INTO chats (title, modelId) VALUES (?, ?)`,
+      [title, modelId]
+    );
+
+    if (result.lastInsertRowId) {
+      const defaultSettings = await readDefaultChatSettings();
+      if (defaultSettings) {
+        await setChatSettings(db, result.lastInsertRowId, {
+          systemPrompt: modelSystemPrompt ?? defaultSettings.systemPrompt,
+        });
+      }
+    }
+
+    return result.lastInsertRowId;
+  } catch (error) {
+    console.error('Error creating chat:', error);
+  }
+};
+
+export const getAllChats = async (db: SQLiteDatabase): Promise<Chat[]> => {
+  const chats = await db.getAllAsync<Chat & { enabledSources: string | null }>(
+    `SELECT c.*, 
+            GROUP_CONCAT(cs.sourceId) as enabledSources
+     FROM chats c
+     LEFT JOIN chatSources cs ON c.id = cs.chatId
+     GROUP BY c.id
+     ORDER BY c.id DESC`
+  );
+
+  return chats.map((chat) => ({
+    ...chat,
+    enabledSources: chat.enabledSources
+      ? chat.enabledSources.split(',').map((id) => parseInt(id, 10))
+      : [],
+  }));
+};
+
+export const getChatMessages = async (
+  db: SQLiteDatabase,
+  chatId: number
+): Promise<Message[]> => {
+  const messages = await db.getAllAsync<RawMessage>(
+    `SELECT * FROM messages WHERE chatId = ? ORDER BY id ASC`,
+    [chatId]
+  );
+
+  return messages.map((message) => ({
+    ...message,
+    sourceDocuments: parseSourceDocuments(message.sourceDocuments),
+    groundingCaveats: parseGroundingCaveats(message.groundingCaveats),
+    retrievalStats: parseRetrievalStats(message.retrievalStats),
+    stoppedByUser: message.stoppedByUser === 1,
+    cutShortReason: parseCutShortReason(message.cutShortReason),
+  }));
+};
+
+export const markMessageStopped = async (
+  db: SQLiteDatabase,
+  messageId: number,
+  stopped: boolean = true
+): Promise<void> => {
+  await db.runAsync(`UPDATE messages SET stoppedByUser = ? WHERE id = ?`, [
+    stopped ? 1 : 0,
+    messageId,
+  ]);
+};
+
+export const markMessageCutShort = async (
+  db: SQLiteDatabase,
+  messageId: number,
+  reason: CutShortReason | null
+): Promise<void> => {
+  await db.runAsync(`UPDATE messages SET cutShortReason = ? WHERE id = ?`, [
+    reason,
+    messageId,
+  ]);
+};
+
+export const persistMessage = async (
+  db: SQLiteDatabase,
+  message: Omit<Message, 'id' | 'timestamp'>
+): Promise<number> => {
+  const result = await db.runAsync(
+    `INSERT INTO messages (chatId, role, content, modelName, tokensPerSecond, timeToFirstToken, imagePath, documentName, sourceDocuments, groundingCaveats, retrievalStats, stoppedByUser, cutShortReason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+    [
+      message.chatId,
+      message.role,
+      message.content,
+      message.modelName || '',
+      message.tokensPerSecond ?? 0,
+      message.timeToFirstToken ?? 0,
+      message.imagePath || null,
+      message.documentName || null,
+      message.sourceDocuments?.length
+        ? JSON.stringify(message.sourceDocuments)
+        : null,
+      message.groundingCaveats?.length
+        ? JSON.stringify(message.groundingCaveats)
+        : null,
+      serializeRetrievalStats(message.retrievalStats),
+      message.stoppedByUser ? 1 : 0,
+      message.cutShortReason ?? null,
+    ]
+  );
+
+  //If the message is event type, we don't update the lastUsed timestamp so the chat won't be elevated on the chat list
+  if (message.role !== 'event') {
+    const timestamp = Date.now();
+    await db.runAsync(`UPDATE chats SET lastUsed = ? WHERE id = ?`, [
+      timestamp,
+      message.chatId,
+    ]);
+  }
+
+  return result.lastInsertRowId;
+};
+
+// SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds.
+// 12 params per row, so 80 rows per batch keeps us well under the limit.
+const IMPORT_BATCH_SIZE = 70;
+const MAX_PREVIEW_LENGTH = 72;
+
+export const importMessages = async (
+  db: SQLiteDatabase,
+  chatId: number,
+  messages: Message[]
+): Promise<void> => {
+  if (messages.length === 0) return;
+
+  for (let i = 0; i < messages.length; i += IMPORT_BATCH_SIZE) {
+    const batch = messages.slice(i, i + IMPORT_BATCH_SIZE);
+    const placeholders = batch
+      .map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .join(', ');
+    const flattenedValues = batch.flatMap((msg) => [
+      chatId,
+      msg.role,
+      msg.content,
+      msg.timestamp ?? Date.now(),
+      msg.modelName ?? '',
+      msg.tokensPerSecond ?? 0,
+      msg.timeToFirstToken ?? 0,
+      msg.imagePath ?? null,
+      msg.documentName ?? null,
+      msg.sourceDocuments?.length ? JSON.stringify(msg.sourceDocuments) : null,
+      msg.groundingCaveats?.length
+        ? JSON.stringify(msg.groundingCaveats)
+        : null,
+      serializeRetrievalStats(msg.retrievalStats),
+      msg.stoppedByUser ? 1 : 0,
+      parseCutShortReason(msg.cutShortReason) ?? null,
+    ]);
+    await db.runAsync(
+      `INSERT INTO messages (chatId, role, content, timestamp, modelName, tokensPerSecond, timeToFirstToken, imagePath, documentName, sourceDocuments, groundingCaveats, retrievalStats, stoppedByUser, cutShortReason) VALUES ${placeholders}`,
+      flattenedValues
+    );
+  }
+};
+
+const getBranchMessagePreview = (message: Message): string => {
+  const normalized = message.content.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    if (message.documentName) return message.documentName;
+    if (message.imagePath) return 'Image message';
+    return 'Message';
+  }
+
+  return normalized.length > MAX_PREVIEW_LENGTH
+    ? `${normalized.slice(0, MAX_PREVIEW_LENGTH)}...`
+    : normalized;
+};
+
+const copyMessagesWithIdMap = async (
+  db: SQLiteDatabase,
+  chatId: number,
+  messages: Message[]
+): Promise<Map<number, number>> => {
+  const idMap = new Map<number, number>();
+
+  for (const msg of messages) {
+    const result = await db.runAsync(
+      `
+        INSERT INTO messages (
+          chatId,
+          role,
+          content,
+          timestamp,
+          modelName,
+          tokensPerSecond,
+          timeToFirstToken,
+          imagePath,
+          documentName,
+          sourceDocuments,
+          groundingCaveats,
+          retrievalStats,
+          stoppedByUser,
+          cutShortReason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        chatId,
+        msg.role,
+        msg.content,
+        msg.timestamp ?? Date.now(),
+        msg.modelName ?? '',
+        msg.tokensPerSecond ?? 0,
+        msg.timeToFirstToken ?? 0,
+        msg.imagePath ?? null,
+        msg.documentName ?? null,
+        msg.sourceDocuments?.length
+          ? JSON.stringify(msg.sourceDocuments)
+          : null,
+        msg.groundingCaveats?.length
+          ? JSON.stringify(msg.groundingCaveats)
+          : null,
+        serializeRetrievalStats(msg.retrievalStats),
+        msg.stoppedByUser ? 1 : 0,
+        msg.cutShortReason ?? null,
+      ]
+    );
+    idMap.set(msg.id, result.lastInsertRowId);
+  }
+
+  return idMap;
+};
+
+export const getChatBranchMarkers = async (
+  db: SQLiteDatabase,
+  chatId: number
+): Promise<ChatBranchMarker[]> => {
+  return db.getAllAsync<ChatBranchMarker>(
+    `SELECT * FROM chatBranches WHERE chatId = ? ORDER BY afterMessageId ASC, id ASC`,
+    [chatId]
+  );
+};
+
+export const forkChat = async (
+  db: SQLiteDatabase,
+  originalChatId: number,
+  targetMessageId: number
+): Promise<number> => {
+  let newChatId: number | undefined;
+
+  await db.withTransactionAsync(async () => {
+    const originalChat = await db.getFirstAsync<Chat>(
+      `SELECT * FROM chats WHERE id = ?`,
+      [originalChatId]
+    );
+
+    if (!originalChat) {
+      throw new Error(`Chat ${originalChatId} not found`);
+    }
+
+    const messages = await getChatMessages(db, originalChatId);
+    const targetIndex = messages.findIndex(
+      (message) => message.id === targetMessageId
+    );
+
+    if (targetIndex === -1) {
+      throw new Error(
+        `Message ${targetMessageId} not found in chat ${originalChatId}`
+      );
+    }
+
+    const result = await db.runAsync(
+      `INSERT INTO chats (title, modelId, lastUsed) VALUES (?, ?, ?)`,
+      [originalChat.title, originalChat.modelId, Date.now()]
+    );
+
+    newChatId = result.lastInsertRowId;
+    const messagesToCopy = messages.slice(0, targetIndex + 1);
+    const targetMessage = messages[targetIndex];
+
+    const messageIdMap = await copyMessagesWithIdMap(
+      db,
+      newChatId,
+      messagesToCopy
+    );
+    const copiedMessageIds = new Set(
+      messagesToCopy.map((message) => message.id)
+    );
+    const originalBranchMarkers = await getChatBranchMarkers(
+      db,
+      originalChatId
+    );
+
+    for (const marker of originalBranchMarkers) {
+      if (!copiedMessageIds.has(marker.afterMessageId)) continue;
+      if (marker.afterMessageId === targetMessageId) continue;
+
+      const copiedAfterMessageId = messageIdMap.get(marker.afterMessageId);
+      if (!copiedAfterMessageId) continue;
+
+      await db.runAsync(
+        `
+          INSERT INTO chatBranches (
+            chatId,
+            afterMessageId,
+            sourceChatId,
+            sourceMessageId,
+            sourceChatTitle,
+            sourceMessagePreview
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `,
+        [
+          newChatId,
+          copiedAfterMessageId,
+          marker.sourceChatId,
+          marker.sourceMessageId,
+          marker.sourceChatTitle,
+          marker.sourceMessagePreview,
+        ]
+      );
+    }
+
+    const copiedTargetMessageId = messageIdMap.get(targetMessageId);
+    if (!copiedTargetMessageId) {
+      throw new Error('Failed to copy branch target message');
+    }
+
+    await db.runAsync(
+      `
+        INSERT INTO chatBranches (
+          chatId,
+          afterMessageId,
+          sourceChatId,
+          sourceMessageId,
+          sourceChatTitle,
+          sourceMessagePreview
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [
+        newChatId,
+        copiedTargetMessageId,
+        originalChatId,
+        targetMessageId,
+        originalChat.title,
+        getBranchMessagePreview(targetMessage),
+      ]
+    );
+
+    await db.runAsync(
+      `
+        INSERT INTO chatSettings (chatId, systemPrompt, thinkingEnabled)
+        SELECT ?, systemPrompt, thinkingEnabled
+        FROM chatSettings
+        WHERE chatId = ?
+      `,
+      [newChatId, originalChatId]
+    );
+
+    await db.runAsync(
+      `
+        INSERT INTO chatSources (chatId, sourceId)
+        SELECT ?, sourceId
+        FROM chatSources
+        WHERE chatId = ?
+      `,
+      [newChatId, originalChatId]
+    );
+  });
+
+  if (newChatId === undefined) {
+    throw new Error('Failed to fork chat');
+  }
+
+  return newChatId;
+};
+
+export const deleteChat = async (
+  db: SQLiteDatabase,
+  chatId: number
+): Promise<void> => {
+  await db.runAsync(`DELETE FROM chats WHERE id = ?;`, [chatId]);
+};
+
+const thinkingEnabledFromDb = (value: number | null): boolean | undefined => {
+  if (value === 1) return true;
+  if (value === 0) return false;
+  return undefined;
+};
+
+const thinkingEnabledToDb = (value: boolean | undefined): number | null => {
+  if (value === undefined) return null;
+  return value ? 1 : 0;
+};
+
+export const getChatSettings = async (
+  db: SQLiteDatabase,
+  chatId: number | null
+): Promise<ChatSettings> => {
+  const result = await db.getFirstAsync<{
+    systemPrompt: string;
+    thinkingEnabled: number | null;
+  }>(
+    'SELECT systemPrompt, thinkingEnabled FROM chatSettings WHERE chatId = ?',
+    [chatId]
+  );
+
+  if (!result) {
+    const defaultSettings = await readDefaultChatSettings();
+    if (defaultSettings) {
+      return defaultSettings;
+    }
+  }
+
+  return result
+    ? {
+        systemPrompt: result.systemPrompt,
+        thinkingEnabled: thinkingEnabledFromDb(result.thinkingEnabled),
+      }
+    : {
+        systemPrompt: '',
+      };
+};
+
+export const setChatSettings = async (
+  db: SQLiteDatabase,
+  chatId: number | null,
+  settings: ChatSettings
+): Promise<void> => {
+  if (chatId === null) {
+    await AsyncStorage.setItem(
+      DEFAULT_CHAT_SETTINGS_KEY,
+      JSON.stringify(settings)
+    );
+  } else {
+    const thinkingValue = thinkingEnabledToDb(settings.thinkingEnabled);
+
+    await db.runAsync(
+      `
+    INSERT INTO chatSettings (chatId, systemPrompt, thinkingEnabled)
+    VALUES (?, ?, ?)
+    ON CONFLICT(chatId) DO UPDATE SET
+      systemPrompt = excluded.systemPrompt,
+      thinkingEnabled = excluded.thinkingEnabled
+  `,
+      [chatId, settings.systemPrompt, thinkingValue]
+    );
+  }
+};
+
+export const getChatDigest = async (
+  db: SQLiteDatabase,
+  chatId: number
+): Promise<string | null> => {
+  const result = await db.getFirstAsync<{ digest: string | null }>(
+    'SELECT digest FROM chatSettings WHERE chatId = ?',
+    [chatId]
+  );
+  return result?.digest ?? null;
+};
+
+export const setChatDigest = async (
+  db: SQLiteDatabase,
+  chatId: number,
+  digest: string
+): Promise<void> => {
+  await db.runAsync(
+    `
+    INSERT INTO chatSettings (chatId, digest)
+    VALUES (?, ?)
+    ON CONFLICT(chatId) DO UPDATE SET
+      digest = excluded.digest
+  `,
+    [chatId, digest]
+  );
+};
+
+export const renameChat = async (
+  db: SQLiteDatabase,
+  id: number,
+  newTitle: string
+) => {
+  await db.runAsync(`UPDATE chats SET title = ? WHERE id = ?`, [newTitle, id]);
+
+  return;
+};
+
+export const setChatModel = async (
+  db: SQLiteDatabase,
+  id: number,
+  model: number
+) => {
+  await db.runAsync(`UPDATE chats SET modelId = ? WHERE id = ?`, [model, id]);
+  return;
+};
+
+export const getNextChatId = async (db: SQLiteDatabase): Promise<number> => {
+  const result = await db.getFirstAsync<{ seq: number }>(
+    `SELECT seq FROM sqlite_sequence WHERE name = 'chats'`
+  );
+  return (result?.seq ?? 0) + 1;
+};
+
+export const checkIfChatExists = async (
+  db: SQLiteDatabase,
+  chatId: number
+): Promise<boolean> => {
+  const result = await db.getFirstAsync<{ id: number }>(
+    `SELECT id FROM chats WHERE id = ?`,
+    [chatId]
+  );
+  return !!result;
+};

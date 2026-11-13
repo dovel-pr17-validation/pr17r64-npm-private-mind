@@ -1,0 +1,871 @@
+import { SQLiteDatabase } from 'expo-sqlite';
+import { create } from 'zustand';
+import {
+  Model,
+  getAllModels,
+  addModel,
+  updateModelDownloaded,
+  removeModelFiles,
+  updateModel,
+  syncBuiltInModelPaths,
+} from '../database/modelRepository';
+import { type RetiredModel } from '../database/db';
+import Toast from 'react-native-toast-message';
+import { ResourceFetcher } from 'react-native-executorch/legacy';
+import { ExpoResourceFetcher } from 'react-native-executorch-expo-resource-fetcher/legacy';
+import { Feedback } from '../utils/Feedback';
+import {
+  describeDownloadError,
+  recordDownloadEvent,
+  type DownloadPhase,
+} from '../utils/downloadDiagnostics';
+import { RateSample, nextProgressRate } from '../utils/downloadEta';
+import NetInfo from '@react-native-community/netinfo';
+import {
+  needsUpdate,
+  requiredUpdates,
+  type RetiredModelNotice,
+} from '../utils/modelUpdate';
+import {
+  getModelUpdateConsent,
+  setModelUpdateConsent,
+  type ModelUpdateConsent,
+} from '../utils/modelUpdateConsent';
+import {
+  getRetiredModelNotices,
+  setRetiredModelNotices,
+} from '../utils/retiredModelNotices';
+import {
+  isOutOfSpaceError,
+  showNotEnoughStorage,
+  storageShortfall,
+} from '../utils/storageSpace';
+import { hasDownloadedCopy } from '../utils/downloadedCopy';
+import {
+  ConnectionLostError,
+  MAX_RECONNECTS,
+  connectionLostMessage,
+  isConnectionLostError,
+  lostConnection,
+  waitUntilOnlineAndActive,
+} from '../utils/downloadReconnect';
+import {
+  CANCEL_DEADLINE_MS,
+  CANCEL_POLL_MS,
+  isNotFetchingYet,
+  wait,
+} from '../utils/cancelFetching';
+import { announceModelFilesReplaced } from '../utils/modelFilesReplaced';
+
+export enum ModelState {
+  Downloaded = 'downloaded',
+  Downloading = 'downloading',
+  NotStarted = 'not_started',
+}
+
+export interface DownloadState {
+  progress: number;
+  status: ModelState;
+  rate?: number;
+}
+
+interface DownloadAttempt {
+  model: Model;
+  cancelled: boolean;
+  fetching: boolean;
+  finished: boolean;
+  resumedSinceLastProgress: boolean;
+  settled: Promise<void>;
+  ownedSource: string | null;
+  cancellation: Promise<void>;
+  signalCancelled: () => void;
+}
+
+const attempts = new Map<number, DownloadAttempt>();
+const pausedForBackground = new Map<DownloadAttempt, string>();
+const pausedForPriority = new Map<DownloadAttempt, string>();
+const sourceFetches = new Map<string, Promise<unknown>>();
+
+const sourcesOf = (model: Model) =>
+  [model.modelPath, model.tokenizerPath, model.tokenizerConfigPath] as const;
+
+const createAttempt = (model: Model): DownloadAttempt => {
+  let signalCancelled = () => {};
+  const cancellation = new Promise<void>((resolve) => {
+    signalCancelled = resolve;
+  });
+  return {
+    model,
+    cancelled: false,
+    fetching: false,
+    finished: false,
+    resumedSinceLastProgress: false,
+    settled: Promise.resolve(),
+    ownedSource: null,
+    cancellation,
+    signalCancelled,
+  };
+};
+
+let pauseInFlight: Promise<void> = Promise.resolve();
+
+const pauseActiveDownloads = async (
+  held: Map<DownloadAttempt, string>,
+  pausedEvent: DownloadPhase,
+  alreadyHeld?: Map<DownloadAttempt, string>
+) => {
+  for (const attempt of attempts.values()) {
+    const source = attempt.ownedSource;
+    if (!source || attempt.finished || attempt.cancelled) continue;
+    if (alreadyHeld?.has(attempt)) continue;
+    const { model } = attempt;
+    try {
+      await ExpoResourceFetcher.pauseFetching(source);
+      held.set(attempt, source);
+      recordDownloadEvent(model.id, model.modelName, pausedEvent);
+    } catch (err) {
+      recordDownloadEvent(
+        model.id,
+        model.modelName,
+        'pause-failed',
+        describeDownloadError(err)
+      );
+    }
+  }
+};
+
+const resumePausedDownloads = (
+  held: Map<DownloadAttempt, string>,
+  resumedEvent: DownloadPhase,
+  stillHeld?: Map<DownloadAttempt, string>
+) => {
+  for (const [attempt, source] of [...held]) {
+    held.delete(attempt);
+    if (attempt.finished || attempt.cancelled) continue;
+    if (stillHeld?.has(attempt)) continue;
+    const { model } = attempt;
+    attempt.resumedSinceLastProgress = true;
+    recordDownloadEvent(model.id, model.modelName, resumedEvent);
+    ExpoResourceFetcher.resumeFetching(source).catch((err) =>
+      recordDownloadEvent(
+        model.id,
+        model.modelName,
+        'resume-failed',
+        describeDownloadError(err)
+      )
+    );
+  }
+};
+
+export const pauseDownloadsForBackground = () => {
+  pauseInFlight = pauseInFlight.then(() =>
+    pauseActiveDownloads(pausedForBackground, 'paused-in-background')
+  );
+  return pauseInFlight;
+};
+
+export const resumeDownloadsAfterBackground = () =>
+  pauseInFlight.then(() =>
+    resumePausedDownloads(
+      pausedForBackground,
+      'resumed-in-foreground',
+      pausedForPriority
+    )
+  );
+
+export const pauseModelDownloadsWhile = async <T>(
+  work: () => Promise<T>
+): Promise<T> => {
+  pauseInFlight = pauseInFlight.then(() =>
+    pauseActiveDownloads(
+      pausedForPriority,
+      'paused-for-priority',
+      pausedForBackground
+    )
+  );
+  await pauseInFlight;
+  try {
+    return await work();
+  } finally {
+    resumePausedDownloads(
+      pausedForPriority,
+      'resumed-after-priority',
+      pausedForBackground
+    );
+  }
+};
+
+export const resetDownloadAttempts = () => {
+  attempts.clear();
+  sourceFetches.clear();
+  pausedForPriority.clear();
+};
+
+interface ModelStore {
+  db: SQLiteDatabase | null;
+  models: Model[];
+  downloadedModels: Model[];
+  downloadStates: Record<string, DownloadState>;
+  setDB: (db: SQLiteDatabase) => void;
+  loadModels: () => Promise<void>;
+  addModelToDB: (model: Omit<Model, 'id'>) => Promise<void>;
+  getModelById: (id: number) => Model | undefined;
+  downloadModel: (model: Model) => Promise<void>;
+  cancelDownload: (model: Model) => Promise<void>;
+  removeModel: (modelId: number) => Promise<void>;
+  removeModelFiles: (modelId: number) => Promise<void>;
+  retiredModels: RetiredModelNotice[];
+  discardRetiredModels: (retired: RetiredModel[]) => Promise<void>;
+  updateOutdatedModel: (model: Model) => Promise<void>;
+  updateOutdatedModels: (models?: Model[]) => Promise<void>;
+  updateConsent: ModelUpdateConsent;
+  loadUpdateConsent: () => Promise<void>;
+  rememberUpdateConsent: (
+    modelNames: string[],
+    overMobileData: boolean
+  ) => Promise<void>;
+  forgetUpdateConsent: (modelName: string) => Promise<void>;
+  resumeConsentedUpdates: () => Promise<boolean>;
+  editModel: (
+    modelId: number,
+    localTokenizerPath: string,
+    localTokenizerConfigPath: string,
+    newModelName: string
+  ) => Promise<void>;
+}
+
+const PROGRESS_PUBLISH_INTERVAL_MS = 250;
+
+const stopFetching = async (model: Model, attempt: DownloadAttempt) => {
+  const deadline = Date.now() + CANCEL_DEADLINE_MS;
+
+  while (!attempt.finished && attempt.fetching) {
+    if (Date.now() > deadline) {
+      recordDownloadEvent(
+        model.id,
+        model.modelName,
+        'cancel-failed',
+        'the fetcher never registered the download'
+      );
+      return;
+    }
+
+    const source = attempt.ownedSource;
+    if (source) {
+      try {
+        await ExpoResourceFetcher.cancelFetching(source);
+        recordDownloadEvent(model.id, model.modelName, 'cancel-landed');
+        return;
+      } catch (err) {
+        if (!isNotFetchingYet(err)) {
+          recordDownloadEvent(
+            model.id,
+            model.modelName,
+            'cancel-failed',
+            describeDownloadError(err)
+          );
+          console.warn('Failed to cancel download:', err);
+          return;
+        }
+      }
+    }
+    recordDownloadEvent(model.id, model.modelName, 'cancel-waiting');
+    await wait(CANCEL_POLL_MS);
+  }
+};
+
+const sizeOf = async (source: string) => {
+  try {
+    return (await ExpoResourceFetcher.getFilesTotalSize(source)) || 0;
+  } catch {
+    return 0;
+  }
+};
+
+const totalOf = (sizes: readonly number[]) =>
+  sizes.reduce((sum, size) => sum + size, 0);
+
+const weightsFor = (sizes: readonly number[]) => {
+  const total = totalOf(sizes);
+  if (total > 0) return sizes.map((size) => size / total);
+  return sizes.map(() => 1 / sizes.length);
+};
+
+const fetchSharedSource = async (
+  attempt: DownloadAttempt,
+  source: string,
+  onProgress: (progress: number) => void
+) => {
+  const { model } = attempt;
+  let inFlight = sourceFetches.get(source);
+  while (inFlight) {
+    recordDownloadEvent(
+      model.id,
+      model.modelName,
+      'waiting-for-shared-file',
+      source
+    );
+    await Promise.race([inFlight.catch(() => {}), attempt.cancellation]);
+    if (attempt.cancelled) return false;
+    inFlight = sourceFetches.get(source);
+  }
+
+  // Registering must stay synchronous after the check above, or two models can both start fetching the source.
+  const fetching = ResourceFetcher.fetch(onProgress, source);
+  sourceFetches.set(source, fetching);
+  attempt.ownedSource = source;
+  try {
+    await fetching;
+  } finally {
+    attempt.ownedSource = null;
+    if (sourceFetches.get(source) === fetching) sourceFetches.delete(source);
+  }
+  return true;
+};
+
+const fetchSurvivingDisconnects = async (
+  attempt: DownloadAttempt,
+  source: string,
+  onProgress: (progress: number) => void
+) => {
+  const { model } = attempt;
+  for (let reconnects = 0; ; reconnects += 1) {
+    try {
+      return await fetchSharedSource(attempt, source, onProgress);
+    } catch (err) {
+      if (attempt.cancelled || reconnects >= MAX_RECONNECTS) throw err;
+      if (isOutOfSpaceError(err) || !(await lostConnection(err))) throw err;
+      recordDownloadEvent(
+        model.id,
+        model.modelName,
+        'waiting-for-network',
+        describeDownloadError(err)
+      );
+      const reconnected = await Promise.race([
+        waitUntilOnlineAndActive(),
+        attempt.cancellation.then(() => false),
+      ]);
+      if (attempt.cancelled) return false;
+      if (!reconnected) throw new ConnectionLostError(err);
+      attempt.resumedSinceLastProgress = true;
+      recordDownloadEvent(model.id, model.modelName, 'reconnected');
+    }
+  }
+};
+
+// Wrapper around ExpoResourceFetcher.deleteResources that swallows errors.
+// We pass model.* source paths (URLs); the fetcher derives the on-disk
+// filename and deletes only files it manages — never user-supplied local paths.
+async function deleteRemoteResources(...sources: string[]) {
+  if (sources.length === 0) return;
+  try {
+    await ExpoResourceFetcher.deleteResources(...sources);
+  } catch (err) {
+    console.warn('ExpoResourceFetcher.deleteResources failed:', err);
+  }
+}
+
+const retryDownload = (model: Model) => {
+  const { getModelById, downloadModel } = useModelStore.getState();
+  return downloadModel(getModelById(model.id) ?? model);
+};
+
+const sourcesNoOtherModelNeeds = (
+  modelId: number,
+  sources: string[]
+): string[] => {
+  const { models, downloadStates } = useModelStore.getState();
+  const needed = new Set(
+    models
+      .filter(
+        (other) =>
+          other.id !== modelId &&
+          other.source !== 'local' &&
+          (other.isDownloaded ||
+            downloadStates[other.id]?.status === ModelState.Downloading)
+      )
+      .flatMap(sourcesOf)
+  );
+  return sources.filter((source) => !needed.has(source));
+};
+
+const outdatedSourcesNoOtherModelNeeds = (model: Model): string[] => {
+  const needed = new Set(
+    useModelStore
+      .getState()
+      .models.filter((other) => other.id !== model.id)
+      .flatMap((other) => [
+        ...(other.isDownloaded ? sourcesOf(other) : []),
+        ...(other.outdatedSources ?? []),
+      ])
+  );
+  return (model.outdatedSources ?? []).filter((source) => !needed.has(source));
+};
+
+let updatingOutdatedModels: Promise<void> | null = null;
+
+const runDownload = async (model: Model, attempt: DownloadAttempt) => {
+  const isCurrent = () =>
+    attempts.get(model.id) === attempt && !attempt.cancelled;
+
+  let lastSample: RateSample | undefined;
+  let rate: number | undefined;
+
+  const publish = (progress: number, status: DownloadState['status']) => {
+    if (!isCurrent()) return;
+    const sample = { progress, at: Date.now() };
+    if (lastSample && !attempt.resumedSinceLastProgress) {
+      rate = nextProgressRate(rate, lastSample, sample);
+    }
+    attempt.resumedSinceLastProgress = false;
+    lastSample = sample;
+    useModelStore.setState((state) => ({
+      downloadStates: {
+        ...state.downloadStates,
+        [model.id]: { progress, status, rate },
+      },
+    }));
+  };
+
+  try {
+    if (attempt.cancelled) {
+      recordDownloadEvent(
+        model.id,
+        model.modelName,
+        'abandoned',
+        'cancelled while queued'
+      );
+      return;
+    }
+
+    recordDownloadEvent(model.id, model.modelName, 'started');
+
+    let lastReportedProgress = 0;
+    let lastReportTime = 0;
+
+    const reportProgress = (p: number) => {
+      const now = Date.now();
+      if (
+        p > lastReportedProgress &&
+        now - lastReportTime >= PROGRESS_PUBLISH_INTERVAL_MS
+      ) {
+        lastReportedProgress = p;
+        lastReportTime = now;
+        publish(p, ModelState.Downloading);
+      }
+    };
+
+    let filesOnDisk = 0;
+
+    try {
+      attempt.fetching = true;
+      const sources = sourcesOf(model);
+      const sizes = await Promise.all(sources.map(sizeOf));
+      const shortfall = storageShortfall(
+        totalOf(sizes.filter((_, index) => !hasDownloadedCopy(sources[index])))
+      );
+      if (shortfall) {
+        if (!isCurrent()) return;
+        publish(0, ModelState.NotStarted);
+        recordDownloadEvent(
+          model.id,
+          model.modelName,
+          'failed',
+          `not enough storage: needs ${shortfall.neededBytes} B, ${shortfall.freeBytes} B free`
+        );
+        showNotEnoughStorage(model.modelName, shortfall, () =>
+          retryDownload(model)
+        );
+        return;
+      }
+      const weights = weightsFor(sizes);
+      let completed = 0;
+
+      for (const [index, source] of sources.entries()) {
+        if (attempt.cancelled) break;
+        const before = completed;
+        const weight = weights[index]!;
+        const fetched = await fetchSurvivingDisconnects(attempt, source, (p) =>
+          reportProgress(before + p * weight)
+        );
+        if (!fetched) break;
+        completed += weight;
+        filesOnDisk += 1;
+      }
+
+      if (!isCurrent()) {
+        recordDownloadEvent(
+          model.id,
+          model.modelName,
+          'abandoned',
+          'finished after the user moved on'
+        );
+        return;
+      }
+
+      const db = useModelStore.getState().db;
+      if (db) {
+        await updateModelDownloaded(db, model.id, 1);
+        await useModelStore.getState().loadModels();
+      }
+
+      if (!isCurrent()) return;
+      publish(1, ModelState.Downloaded);
+      recordDownloadEvent(model.id, model.modelName, 'completed');
+      Feedback.downloadComplete();
+      Toast.show({
+        type: 'defaultToast',
+        text1: `${model.modelName} has been successfully downloaded`,
+      });
+    } catch (err) {
+      if (!isCurrent()) {
+        recordDownloadEvent(
+          model.id,
+          model.modelName,
+          'abandoned',
+          describeDownloadError(err)
+        );
+        return;
+      }
+      publish(0, ModelState.NotStarted);
+      recordDownloadEvent(
+        model.id,
+        model.modelName,
+        'failed',
+        describeDownloadError(err)
+      );
+      console.error('Failed:', err);
+      if (isOutOfSpaceError(err)) {
+        showNotEnoughStorage(model.modelName, undefined, () =>
+          retryDownload(model)
+        );
+        return;
+      }
+      if (err instanceof ConnectionLostError || isConnectionLostError(err)) {
+        Toast.show({
+          type: 'defaultToast',
+          text1: connectionLostMessage(model.modelName),
+          props: { onRetry: () => retryDownload(model) },
+        });
+        return;
+      }
+      Toast.show({
+        type: 'defaultToast',
+        text1:
+          filesOnDisk > 0
+            ? `${model.modelName} download was interrupted. Downloaded files are kept.`
+            : `${model.modelName} could not be downloaded.`,
+        props: { onRetry: () => retryDownload(model) },
+      });
+    }
+  } finally {
+    attempt.fetching = false;
+    attempt.finished = true;
+    if (attempts.get(model.id) === attempt) attempts.delete(model.id);
+  }
+};
+
+export const useModelStore = create<ModelStore>((set, get) => ({
+  db: null,
+  models: [],
+  downloadedModels: [],
+  downloadStates: {},
+  retiredModels: [],
+  updateConsent: { modelNames: [], overMobileData: false },
+
+  setDB: (db) => set({ db }),
+
+  getModelById: (id: number) => {
+    const models = get().models;
+    return models.find((model) => model.id === id);
+  },
+
+  loadModels: async () => {
+    const db = get().db;
+    if (!db) return;
+    const models = await getAllModels(db);
+    set({
+      models,
+      downloadedModels: models.filter((m) => m.isDownloaded),
+    });
+  },
+
+  addModelToDB: async (model: Omit<Model, 'id'>) => {
+    const db = get().db;
+    if (!db) return;
+    await addModel(db, model);
+    await get().loadModels();
+  },
+
+  downloadModel: async (model: Model) => {
+    const previous = attempts.get(model.id);
+    if (previous && !previous.cancelled) return;
+
+    recordDownloadEvent(model.id, model.modelName, 'requested');
+
+    const attempt = createAttempt(model);
+    attempt.settled = (previous?.settled ?? Promise.resolve())
+      .then(() => runDownload(model, attempt))
+      .catch((err) => {
+        recordDownloadEvent(
+          model.id,
+          model.modelName,
+          'failed',
+          describeDownloadError(err)
+        );
+        console.error('Download attempt crashed:', err);
+      });
+    attempts.set(model.id, attempt);
+    set((state) => ({
+      downloadStates: {
+        ...state.downloadStates,
+        [model.id]: { progress: 0, status: ModelState.Downloading },
+      },
+    }));
+
+    if (previous) {
+      recordDownloadEvent(
+        model.id,
+        model.modelName,
+        'queued',
+        'waiting for the cancelled download to stop'
+      );
+    }
+
+    await attempt.settled;
+  },
+
+  cancelDownload: async (model: Model) => {
+    const attempt = attempts.get(model.id);
+    recordDownloadEvent(
+      model.id,
+      model.modelName,
+      'cancel-requested',
+      attempt ? undefined : 'nothing in flight'
+    );
+
+    set((state) => ({
+      downloadStates: {
+        ...state.downloadStates,
+        [model.id]: { progress: 0, status: ModelState.NotStarted },
+      },
+    }));
+    const forgotten = get().forgetUpdateConsent(model.modelName);
+
+    if (!attempt) {
+      await forgotten;
+      return;
+    }
+    attempt.cancelled = true;
+    attempt.signalCancelled();
+    await stopFetching(model, attempt);
+    await forgotten;
+  },
+
+  removeModelFiles: async (modelId: number) => {
+    const db = get().db;
+    if (!db) return;
+
+    const model = get().models.find((m) => m.id === modelId);
+    if (!model) return;
+
+    try {
+      // Only `local` models point at user-provided files we must never touch.
+      // `remote` and `built-in` both download into the app sandbox via the
+      // resource fetcher, so the same cleanup path applies to both.
+      if (model.source !== 'local') {
+        await deleteRemoteResources(
+          ...sourcesNoOtherModelNeeds(modelId, [...sourcesOf(model)])
+        );
+      }
+      await updateModelDownloaded(db, modelId, 0);
+      // Re-sync stored URLs so an immediate re-download uses current paths.
+      if (model.source === 'built-in') {
+        await syncBuiltInModelPaths(db, modelId, model.modelName);
+      }
+      await get().loadModels();
+      set((state) => {
+        const { [modelId]: _, ...rest } = state.downloadStates;
+        return { downloadStates: rest };
+      });
+    } catch (err) {
+      console.error('Failed to remove model files:', err);
+    }
+  },
+
+  discardRetiredModels: async (retired: RetiredModel[]) => {
+    const remembered = await getRetiredModelNotices();
+    if (retired.length === 0) {
+      set({ retiredModels: remembered });
+      return;
+    }
+    await deleteRemoteResources(...retired.flatMap((model) => model.sources));
+    const fresh = retired.map(({ modelName, replacement }) => ({
+      modelName,
+      replacement,
+    }));
+    const notices = [
+      ...remembered.filter(
+        (notice) => !fresh.some((f) => f.modelName === notice.modelName)
+      ),
+      ...fresh,
+    ];
+    await setRetiredModelNotices(notices);
+    set({ retiredModels: notices });
+  },
+
+  updateOutdatedModel: async (model: Model) => {
+    if (!needsUpdate(model)) return;
+
+    await get().downloadModel(
+      model.latestSources ? { ...model, ...model.latestSources } : model
+    );
+    const db = get().db;
+    if (!db) return;
+    if (get().downloadStates[model.id]?.status !== ModelState.Downloaded)
+      return;
+
+    const replaced = outdatedSourcesNoOtherModelNeeds(model);
+    await syncBuiltInModelPaths(db, model.id, model.modelName);
+    await get().loadModels();
+    const updated = get().getModelById(model.id);
+    if (updated) announceModelFilesReplaced(updated);
+    await deleteRemoteResources(...replaced);
+    await get().forgetUpdateConsent(model.modelName);
+  },
+
+  updateOutdatedModels: (models?: Model[]) => {
+    if (updatingOutdatedModels) return updatingOutdatedModels;
+    const queue = (
+      models ?? requiredUpdates(get().models, get().retiredModels)
+    ).map(({ id }) => id);
+    updatingOutdatedModels = (async () => {
+      try {
+        for (const id of queue) {
+          const model = get().getModelById(id);
+          if (!model) continue;
+          if (needsUpdate(model)) {
+            await get().updateOutdatedModel(model);
+          } else if (!model.isDownloaded) {
+            await get().downloadModel(model);
+            if (get().getModelById(id)?.isDownloaded)
+              await get().forgetUpdateConsent(model.modelName);
+          }
+        }
+      } finally {
+        updatingOutdatedModels = null;
+      }
+    })();
+    return updatingOutdatedModels;
+  },
+
+  loadUpdateConsent: async () => {
+    set({ updateConsent: await getModelUpdateConsent() });
+  },
+
+  rememberUpdateConsent: async (modelNames, overMobileData) => {
+    const current = get().updateConsent;
+    const consent = {
+      modelNames: [...new Set([...current.modelNames, ...modelNames])],
+      overMobileData,
+    };
+    set({ updateConsent: consent });
+    await setModelUpdateConsent(consent);
+  },
+
+  forgetUpdateConsent: async (modelName) => {
+    const current = get().updateConsent;
+    if (!current.modelNames.includes(modelName)) return;
+    const consent = {
+      ...current,
+      modelNames: current.modelNames.filter((name) => name !== modelName),
+    };
+    set({ updateConsent: consent });
+    await setModelUpdateConsent(consent);
+  },
+
+  resumeConsentedUpdates: async () => {
+    const { modelNames, overMobileData } = get().updateConsent;
+    const consented = get().models.filter(
+      (model) =>
+        modelNames.includes(model.modelName) &&
+        (needsUpdate(model) || !model.isDownloaded)
+    );
+    if (consented.length === 0) return false;
+    const network = await NetInfo.fetch();
+    if (!network.isConnected) return false;
+    if (network.type !== 'wifi' && !overMobileData) return false;
+    get().updateOutdatedModels(consented);
+    return true;
+  },
+
+  removeModel: async (modelId: number) => {
+    const db = get().db;
+    if (!db) return;
+
+    const model = get().models.find((m) => m.id === modelId);
+    if (!model) return;
+
+    try {
+      if (attempts.has(modelId)) await get().cancelDownload(model);
+      // Reuse removeModelFiles so file cleanup + state reset stay in one place.
+      await get().removeModelFiles(modelId);
+      await removeModelFiles(db, modelId);
+      await get().loadModels();
+    } catch (err) {
+      console.error('Failed to remove model:', err);
+    }
+  },
+
+  editModel: async (
+    modelId: number,
+    localTokenizerPath: string,
+    localTokenizerConfigPath: string,
+    newModelName: string
+  ) => {
+    const db = get().db;
+    if (!db) return;
+
+    const model = get().models.find((m) => m.id === modelId);
+    if (!model) return;
+
+    try {
+      if (model.source === 'remote' && model.isDownloaded) {
+        const oldSources: string[] = [];
+        const newSources: string[] = [];
+
+        if (model.tokenizerPath !== localTokenizerPath) {
+          oldSources.push(model.tokenizerPath);
+          newSources.push(localTokenizerPath);
+        }
+
+        if (model.tokenizerConfigPath !== localTokenizerConfigPath) {
+          oldSources.push(model.tokenizerConfigPath);
+          newSources.push(localTokenizerConfigPath);
+        }
+
+        if (oldSources.length > 0) {
+          // Delete only the on-disk copies of the changed sources, leaving
+          // the model file alone.
+          await deleteRemoteResources(
+            ...sourcesNoOtherModelNeeds(modelId, oldSources)
+          );
+        }
+
+        if (newSources.length > 0) {
+          await ResourceFetcher.fetch(() => {}, ...newSources);
+        }
+      }
+
+      await updateModel(db, {
+        modelId,
+        tokenizerPath: localTokenizerPath,
+        tokenizerConfigPath: localTokenizerConfigPath,
+        newModelName,
+      });
+      await get().loadModels();
+    } catch (err) {
+      console.error('Failed to edit local model:', err);
+    }
+  },
+}));

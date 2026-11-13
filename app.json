@@ -1,0 +1,102 @@
+{
+  "expo": {
+    "scheme": "private-mind",
+    "name": "Private Mind",
+    "slug": "private-mind",
+    "version": "1.3.5",
+    "orientation": "portrait",
+    "icon": "./assets/icons/icon.png",
+    "userInterfaceStyle": "automatic",
+    "plugins": [
+      "react-native-webgpu",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#3D61D6",
+          "imageWidth": 140,
+          "image": "./assets/icons/splash_icon.png"
+        }
+      ],
+      [
+        "expo-font",
+        {
+          "fonts": [
+            "node_modules/@expo-google-fonts/dm-sans/400Regular/DMSans_400Regular.ttf",
+            "node_modules/@expo-google-fonts/dm-sans/500Medium/DMSans_500Medium.ttf",
+            "node_modules/@expo-google-fonts/dm-sans/600SemiBold/DMSans_600SemiBold.ttf",
+            "node_modules/@expo-google-fonts/dm-sans/400Regular_Italic/DMSans_400Regular_Italic.ttf",
+            "node_modules/@expo-google-fonts/dm-sans/500Medium_Italic/DMSans_500Medium_Italic.ttf",
+            "node_modules/@expo-google-fonts/dm-sans/600SemiBold_Italic/DMSans_600SemiBold_Italic.ttf"
+          ]
+        }
+      ],
+      "expo-router",
+      [
+        "expo-sqlite",
+        {
+          "enableFTS": true,
+          "useSQLCipher": false,
+          "android": {
+            "enableFTS": false
+          },
+          "ios": {
+            "customBuildFlags": [
+              "-DSQLITE_ENABLE_DBSTAT_VTAB=1 -DSQLITE_ENABLE_SNAPSHOT=1"
+            ]
+          }
+        }
+      ],
+      [
+        "react-native-audio-api",
+        {
+          "iosBackgroundMode": false,
+          "iosMicrophonePermission": "This app requires access to the microphone to record audio.",
+          "androidForegroundService": false,
+          "androidPermissions": ["android.permission.RECORD_AUDIO"]
+        }
+      ],
+      "expo-asset",
+      "expo-localization",
+      "expo-sharing",
+      "expo-image",
+      "expo-web-browser",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Private Mind reads your photo library only so you can pick an image to attach to a chat. Images never leave your device.",
+          "savePhotosPermission": false,
+          "granularPermissions": ["photo"],
+          "preventAutomaticLimitedAccessAlert": true
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Private Mind uses the camera only to take a photo you attach to a chat. Photos never leave your device.",
+          "recordAudioAndroid": false,
+          "barcodeScannerEnabled": false
+        }
+      ]
+    ],
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.swmansion.privatemind",
+      "appleTeamId": "B357MU264T",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "blockedPermissions": [
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icons/icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.swmansion.privatemind",
+      "edgeToEdgeEnabled": true
+    }
+  }
+}

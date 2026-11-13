@@ -1,0 +1,903 @@
+import React, {
+  memo,
+  Ref,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useState,
+  useCallback,
+  useRef,
+} from 'react';
+import {
+  View,
+  TextInput as RNTextInput,
+  Pressable,
+  Text,
+  StyleSheet,
+  Keyboard,
+  Platform,
+} from 'react-native';
+import Animated, {
+  FadeOut,
+  useAnimatedStyle,
+  useSharedValue,
+  type SharedValue,
+} from 'react-native-reanimated';
+import { type PasteEventPayload, TextInputWrapper } from 'expo-paste-input';
+import EmbeddingDownloadSheet from '../bottomSheets/EmbeddingDownloadSheet';
+import {
+  useAttachment,
+  Attachment,
+  MAX_IMAGE_ATTACHMENTS,
+  type LibraryImage,
+} from '../../hooks/useAttachment';
+import AttachmentOverlay from './attachments/AttachmentOverlay';
+import { USES_SYSTEM_PHOTO_PICKER } from './attachments/usePhotoLibrary';
+import {
+  COMPOSER,
+  COMPOSER_CARD_RADIUS,
+  COMPOSER_STRIP_HEIGHT,
+} from './attachments/constants';
+import { useAttachmentFlights } from './attachments/useAttachmentFlights';
+import { useAttachmentPanel } from './attachments/useAttachmentPanel';
+import { useSheetGeometry } from './attachments/useSheetGeometry';
+import { Model } from '../../database/modelRepository';
+import { isWebSearchReady } from '../../constants/model-profiles';
+import { hasMemoryForWebSearch } from '../../utils/modelCompatibility';
+import { fontFamily, fontSizes, lineHeights } from '../../styles/fontStyles';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import { useChatStore } from '../../store/chatStore';
+import { useLLMStore } from '../../store/llmStore';
+import ModelUnavailableCard from './ModelUnavailableCard';
+import LinkIcon from '../../assets/icons/link-alt.svg';
+import { detectUrls } from '../../utils/web/url/urlDetection';
+import { hostname } from '../../utils/web/hostname';
+import { showPermissionToast } from '../../utils/permissionToast';
+import { Feedback } from '../../utils/Feedback';
+import { TEXT_SELECTION, Theme } from '../../styles/colors';
+import ChatBarActions from './ChatBarActions';
+import ChatSpeechInput from './ChatSpeechInput';
+import PromptSuggestions from './PromptSuggestions';
+import { GRADIENT_EXIT_MS } from './gradientHandoff';
+import ModelUpdateBanner from './ModelUpdateBanner';
+import { useModelStore } from '../../store/modelStore';
+import AttachmentThumbnail from './AttachmentThumbnail';
+import { AudioManager } from 'react-native-audio-api';
+import Toast from 'react-native-toast-message';
+import { useEmbeddingDownloadPrompt } from './useEmbeddingDownloadPrompt';
+import type { SendRefusal } from './useSendChatMessage';
+import { UNSUPPORTED_CPU_REFUSAL } from '../../constants/cpu-support';
+import {
+  BAR_GROW_DURATION,
+  BAR_GROW_LAYOUT,
+  useBarGrowth,
+} from './useBarGrowth';
+import { pressedOpacity } from '../../styles/pressable';
+import {
+  bottomBarPadding,
+  radius,
+  space,
+  stroke,
+} from '../../constants/design-system';
+import { Glass } from '../Glass';
+
+const SENT_ECHO_WINDOW_MS = 300;
+
+const REFUSAL_COPY: Record<SendRefusal, string | null> = {
+  'nothing-to-send': 'Add a message or an attachment first.',
+  'cpu-unsupported': UNSUPPORTED_CPU_REFUSAL,
+  'model-not-started': 'Could not start the model. Try again.',
+  'busy': 'Wait for the response to finish or stop it first.',
+  'chat-not-created': 'Could not start this chat. Try again.',
+  'image-not-saved': null,
+  'image-unsupported':
+    "This model can't see images. Remove the photo or pick a model with Vision.",
+  'model-needs-update':
+    'This model needs a one-time update first. Tap Update at the top of the chat.',
+};
+
+interface Props {
+  chatId: number | null;
+  onSend: (
+    userInput: string,
+    imagePath?: string,
+    attachments?: Attachment[]
+  ) => boolean | void | SendRefusal | Promise<boolean | void | SendRefusal>;
+  onSelectModel: () => void;
+  modelLocked?: boolean;
+  onSelectPrompt: (prompt: string) => void;
+  ref: Ref<{
+    setInput: (text: string) => void;
+  }>;
+  model: Model | undefined;
+  pendingModel?: Model;
+  isVisionModel: boolean;
+  extraContentPadding: SharedValue<number>;
+  onHeightChange?: (height: number) => void;
+  onBarGrow?: () => void;
+  onSpeechInputChange?: (open: boolean) => void;
+  promptsPaused?: boolean;
+  thinkingEnabled: boolean;
+  onThinkingToggle: () => void;
+  webSearchEnabled?: boolean;
+  onWebSearchToggle?: () => boolean | void;
+  hasMessages: boolean;
+  disabled?: boolean;
+  modelSwitching?: boolean;
+  onAttachmentSheetStateChange?: (isOpen: boolean) => void;
+}
+
+const ChatBar = ({
+  chatId,
+  onSend,
+  onSelectModel,
+  modelLocked = false,
+  onSelectPrompt,
+  ref,
+  model,
+  pendingModel,
+  isVisionModel,
+  extraContentPadding,
+  onHeightChange,
+  onBarGrow,
+  onSpeechInputChange,
+  promptsPaused = false,
+  thinkingEnabled,
+  onThinkingToggle,
+  webSearchEnabled,
+  onWebSearchToggle,
+  hasMessages,
+  disabled = false,
+  modelSwitching = false,
+  onAttachmentSheetStateChange,
+}: Props) => {
+  const retiredBy = useModelStore(
+    (state) =>
+      state.retiredModels.find(
+        (retired) => retired.replacement === model?.modelName
+      )?.modelName
+  );
+  const { styles, theme } = useThemedStyles(createStyles);
+  const containerStyle = useMemo(
+    () => [
+      styles.container,
+      { paddingBottom: bottomBarPadding(theme.insets.bottom) },
+    ],
+    [styles.container, theme.insets.bottom]
+  );
+
+  const phantomChatStarts = useChatStore((state) => state.phantomChatStarts);
+  const [userInput, setUserInput] = useState('');
+  const lastSentRef = useRef<{ text: string; at: number } | null>(null);
+  const heldUntilSwitchLandsRef = useRef<string | null>(null);
+  const [isHoldingInput, setIsHoldingInput] = useState(false);
+
+  const handleChangeText = useCallback((text: string) => {
+    const justSent = lastSentRef.current;
+    lastSentRef.current = null;
+    if (
+      justSent &&
+      text === justSent.text &&
+      Date.now() - justSent.at < SENT_ECHO_WINDOW_MS
+    ) {
+      return;
+    }
+    setUserInput(text);
+  }, []);
+  const {
+    attachments,
+    embeddingDownloadSheetRef,
+    addImages,
+    pickSystemPhoto,
+    presentDownloadSheet,
+    pickDocument,
+    addUrlSource,
+    downloadModelAndContinue,
+    markDownloadSheetClosed,
+    markPanelOpen,
+    markPanelClosed,
+    removeAttachment,
+    restoreAttachments,
+    clearAll,
+    addPastedAttachment,
+  } = useAttachment();
+
+  const [panelWindowHeight, setPanelWindowHeight] = useState<number>();
+
+  const {
+    width: screenWidth,
+    composerBottom,
+    gridWidth,
+    gridHeight,
+    sheetTop,
+    sheetBottom,
+    menuMaxBottom,
+  } = useSheetGeometry(panelWindowHeight);
+
+  const [filesBusy, setFilesBusy] = useState(false);
+  const handleSelectFiles = useCallback(() => {
+    setFilesBusy(true);
+    return pickDocument()
+      .catch((error) => {
+        console.error('Failed to open the document picker:', error);
+      })
+      .finally(() => setFilesBusy(false));
+  }, [pickDocument]);
+
+  const showImagesUnsupported = useCallback(() => {
+    Toast.show({
+      type: 'defaultToast',
+      text1: 'This model does not support images',
+    });
+  }, []);
+
+  const handleSelectPhotos = useCallback(
+    () =>
+      pickSystemPhoto().catch((error) => {
+        console.error('Failed to open the photo picker:', error);
+        return 'canceled' as const;
+      }),
+    [pickSystemPhoto]
+  );
+
+  const isGeneratingHere = useLLMStore(
+    (state) => state.isGenerating && state.generatingForChatId === chatId
+  );
+  const isProcessingPromptHere = useLLMStore(
+    (state) => state.isProcessingPrompt && state.generatingForChatId === chatId
+  );
+  const isRespondingHere = isGeneratingHere || isProcessingPromptHere;
+
+  const showAttachmentsBlocked = useCallback(() => {
+    Toast.show({
+      type: 'defaultToast',
+      text1: 'Wait for the response to finish or stop it first.',
+    });
+  }, []);
+
+  const panel = useAttachmentPanel({
+    onSelectFiles: handleSelectFiles,
+    onSelectPhotos: USES_SYSTEM_PHOTO_PICKER ? handleSelectPhotos : undefined,
+    canAttachImages: isVisionModel,
+    onImagesUnsupported: showImagesUnsupported,
+    attachmentsBlocked: isRespondingHere,
+    onAttachmentsBlocked: showAttachmentsBlocked,
+  });
+
+  const handleAttachPhotos = useCallback(
+    (photos: LibraryImage[]) => {
+      addImages(photos).catch((error) => {
+        console.error('Failed to attach the picked photos:', error);
+      });
+    },
+    [addImages]
+  );
+
+  const { flights, isFlying, attach, strip, attachAndLeave } =
+    useAttachmentFlights({
+      hasAttachments: attachments.length > 0,
+      onAttachPhotos: handleAttachPhotos,
+      collapsePanel: panel.collapseForLeave,
+      resetPanel: panel.resetAfterLeave,
+    });
+
+  const rowsBelowStrip = useSharedValue(0);
+  const handleRowsBelowStripLayout = useCallback(
+    (e: { nativeEvent: { layout: { height: number } } }) => {
+      rowsBelowStrip.set(e.nativeEvent.layout.height + COMPOSER.cardPadding);
+    },
+    [rowsBelowStrip]
+  );
+
+  const stripStyle = useAnimatedStyle(() => ({
+    height: strip.get() * COMPOSER_STRIP_HEIGHT,
+  }));
+
+  const pendingIds = flights.map((flight) => flight.photo.id);
+
+  const panelOpenRef = useRef(false);
+  useEffect(() => {
+    panelOpenRef.current = panel.mode !== 'closed';
+    if (panel.mode === 'closed') markPanelClosed();
+    else markPanelOpen();
+  }, [panel.mode, markPanelClosed, markPanelOpen]);
+
+  const { dismissWithoutRefocus: dismissPanelWithoutRefocus } = panel;
+  const dismissPanelIfOpen = useCallback(() => {
+    if (panelOpenRef.current) dismissPanelWithoutRefocus();
+  }, [dismissPanelWithoutRefocus]);
+
+  useEffect(() => {
+    onAttachmentSheetStateChange?.(panel.mode !== 'closed');
+  }, [panel.mode, onAttachmentSheetStateChange]);
+
+  const {
+    embeddingSheetContext,
+    embeddingSheetRequired,
+    handleWebSearchToggle,
+    handleEmbeddingSheetDismiss,
+  } = useEmbeddingDownloadPrompt({
+    model,
+    webSearchEnabled,
+    onWebSearchToggle,
+    presentDownloadSheet,
+    markDownloadSheetClosed,
+    onWillPresentWebPrompt: dismissPanelIfOpen,
+  });
+  const webSearchToggle = onWebSearchToggle ? handleWebSearchToggle : undefined;
+  const thinkingAvailable = !model || model.thinking === true;
+  const webSearchAvailable =
+    isWebSearchReady(model) && hasMemoryForWebSearch(model);
+  const menuTools = useMemo(
+    () => ({
+      thinkingEnabled,
+      thinkingAvailable,
+      onThinkingToggle,
+      webSearchEnabled,
+      webSearchAvailable,
+      onWebSearchToggle: webSearchToggle,
+    }),
+    [
+      thinkingEnabled,
+      thinkingAvailable,
+      onThinkingToggle,
+      webSearchEnabled,
+      webSearchAvailable,
+      webSearchToggle,
+    ]
+  );
+
+  const textInputRef = useRef<RNTextInput>(null);
+  // iOS-only: bump the TextInput key to force a remount when a prompt
+  // suggestion is set programmatically. iOS doesn't re-fire onLayout
+  // for grow after the input has previously grown and shrunk, so
+  // remounting is the only reliable way to make it grow to fit the
+  // new content.
+  const [iosInputKey, setIosInputKey] = useState(0);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      setInput: (text: string) => {
+        setUserInput(text);
+        if (Platform.OS === 'ios') {
+          setIosInputKey((k) => k + 1);
+        }
+      },
+    }),
+    []
+  );
+
+  const composerKey = `${chatId}:${phantomChatStarts}`;
+  const composerKeyRef = useRef(composerKey);
+  if (composerKeyRef.current !== composerKey) {
+    composerKeyRef.current = composerKey;
+    setUserInput('');
+    lastSentRef.current = null;
+    heldUntilSwitchLandsRef.current = null;
+    setIsHoldingInput(false);
+    if (Platform.OS === 'ios') setIosInputKey((key) => key + 1);
+  }
+
+  const handleBarLayoutForPadding = useBarGrowth({
+    extraContentPadding,
+    hasMessages,
+    isResting: !userInput && attachments.length === 0,
+    insetBottom: theme.insets.bottom,
+    ...(onHeightChange ? { onHeightChange } : {}),
+    ...(onBarGrow ? { onBarGrow } : {}),
+  });
+
+  const aTurnIsStarting = useLLMStore((state) => state.isProcessingPrompt);
+  const interrupt = useLLMStore((state) => state.interrupt);
+  const loadModel = useLLMStore((state) => state.loadModel);
+  const loadedModel = useLLMStore((state) => state.model);
+  const loadSelectedModel = useCallback(async () => {
+    if (modelSwitching) return;
+    if (model?.isDownloaded && loadedModel?.id !== model.id) {
+      return loadModel(model);
+    }
+  }, [model, loadedModel, loadModel, modelSwitching]);
+
+  const imageAttachment = attachments.find((a) => a.type === 'image');
+  const hasLoadingAttachment = attachments.some((a) => a.status === 'loading');
+
+  const handleAttach = useCallback(() => {
+    loadSelectedModel();
+    panel.onPlusPress();
+  }, [loadSelectedModel, panel]);
+
+  const detectedUrl = useMemo(
+    () => detectUrls(userInput)[0] ?? null,
+    [userInput]
+  );
+  const showIndexChip =
+    !!detectedUrl && !attachments.some((a) => a.type === 'document');
+  const handleIndexUrl = useCallback(() => {
+    if (!detectedUrl) return;
+    addUrlSource(detectedUrl);
+    setUserInput((prev) =>
+      prev
+        .replace(detectedUrl, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+    );
+  }, [detectedUrl, addUrlSource]);
+
+  const [sendPending, setSendPending] = useState(false);
+  const [sendInFlight, setSendInFlight] = useState(false);
+
+  const clearComposer = useCallback(
+    (sentText: string) => {
+      lastSentRef.current = sentText
+        ? { text: sentText, at: Date.now() }
+        : null;
+      if (Platform.OS === 'ios') {
+        textInputRef.current?.blur();
+        setIosInputKey((key) => key + 1);
+      }
+      setUserInput('');
+      clearAll({ cleanupSources: false });
+    },
+    [clearAll]
+  );
+
+  const releaseHeldInput = useCallback(
+    (clear: boolean) => {
+      const held = heldUntilSwitchLandsRef.current;
+      if (held === null) return;
+      heldUntilSwitchLandsRef.current = null;
+      setIsHoldingInput(false);
+      if (clear) clearComposer(held);
+    },
+    [clearComposer]
+  );
+
+  useEffect(() => {
+    if (!isGeneratingHere && !isProcessingPromptHere) return;
+    setSendInFlight(false);
+    setSendPending(false);
+  }, [isGeneratingHere, isProcessingPromptHere]);
+
+  const settleSend = useCallback(
+    (
+      outcome: ReturnType<Props['onSend']>,
+      inputToSend: string,
+      attachmentsToSend: Attachment[]
+    ) => {
+      Promise.resolve(outcome)
+        .then((accepted) => {
+          if (accepted !== false && typeof accepted !== 'string') return;
+          lastSentRef.current = null;
+          setUserInput((current) => current || inputToSend);
+          if (attachmentsToSend.length) restoreAttachments(attachmentsToSend);
+          const text1 = REFUSAL_COPY[accepted === false ? 'busy' : accepted];
+          if (text1) Toast.show({ type: 'defaultToast', text1 });
+        })
+        .catch((error) => {
+          console.error('Failed to send message:', error);
+        })
+        .finally(() => {
+          setSendPending(false);
+          setSendInFlight(false);
+        });
+    },
+    [restoreAttachments]
+  );
+
+  useEffect(() => {
+    if (aTurnIsStarting) releaseHeldInput(true);
+  }, [aTurnIsStarting, releaseHeldInput]);
+
+  const handleSend = useCallback(() => {
+    if (hasLoadingAttachment || heldUntilSwitchLandsRef.current !== null) {
+      return;
+    }
+    const attachmentsToSend = attachments;
+    const imageUriToSend = imageAttachment?.uri;
+    const inputToSend = userInput.trim();
+    const holdUntilSwitchLands = modelSwitching;
+    setSendInFlight(true);
+    const outcome = onSend(inputToSend, imageUriToSend, attachmentsToSend);
+    Keyboard.dismiss();
+    if (disabled || modelSwitching) setSendPending(true);
+
+    if (holdUntilSwitchLands) {
+      heldUntilSwitchLandsRef.current = userInput;
+      setIsHoldingInput(true);
+    } else {
+      clearComposer(userInput);
+    }
+    Promise.resolve(outcome)
+      .then((accepted) => {
+        if (accepted !== false && typeof accepted !== 'string') return;
+        const text1 = REFUSAL_COPY[accepted === false ? 'busy' : accepted];
+        if (text1) Toast.show({ type: 'defaultToast', text1 });
+        if (holdUntilSwitchLands) {
+          releaseHeldInput(false);
+          return;
+        }
+        lastSentRef.current = null;
+        setUserInput((current) => current || inputToSend);
+        if (attachmentsToSend.length) restoreAttachments(attachmentsToSend);
+      })
+      .catch((error) => {
+        console.error('Failed to send message:', error);
+      })
+      .finally(() => {
+        setSendPending(false);
+        setSendInFlight(false);
+        if (holdUntilSwitchLands) releaseHeldInput(true);
+      });
+  }, [
+    onSend,
+    disabled,
+    userInput,
+    imageAttachment,
+    attachments,
+    clearComposer,
+    releaseHeldInput,
+    restoreAttachments,
+    hasLoadingAttachment,
+    modelSwitching,
+  ]);
+
+  const onPaste = useCallback(
+    (payload: PasteEventPayload) => {
+      try {
+        if (payload.type === 'text') {
+          return;
+        }
+
+        if (payload.type === 'images' && payload.uris?.length > 0) {
+          if (!isVisionModel) {
+            Toast.show({
+              type: 'defaultToast',
+              text1: 'This model does not support images',
+            });
+            return;
+          }
+          payload.uris.forEach((uri) => addPastedAttachment(uri));
+          return;
+        }
+
+        if (payload.type === 'unsupported') {
+          Toast.show({
+            type: 'defaultToast',
+            text1: 'Unsupported clipboard content',
+          });
+        }
+      } catch {
+        Toast.show({
+          type: 'defaultToast',
+          text1: 'Error processing pasted content',
+        });
+      }
+    },
+    [addPastedAttachment, isVisionModel]
+  );
+
+  const [showSpeechInput, setShowSpeechInput] = useState(false);
+
+  useEffect(() => {
+    onSpeechInputChange?.(showSpeechInput);
+  }, [onSpeechInputChange, showSpeechInput]);
+
+  const openSpeechInput = async () => {
+    if (hasLoadingAttachment) {
+      Toast.show({
+        type: 'defaultToast',
+        text1: 'Wait for the attachment to finish loading.',
+      });
+      return;
+    }
+
+    Feedback.speechMode();
+    const permissionStatus = await AudioManager.requestRecordingPermissions();
+    if (permissionStatus !== 'Granted') {
+      showPermissionToast(
+        'Microphone permission is required to record messages.'
+      );
+      return;
+    }
+
+    loadSelectedModel();
+    Keyboard.dismiss();
+    setShowSpeechInput(true);
+  };
+
+  if (showSpeechInput) {
+    const handleSubmit = (transcript: string) => {
+      setShowSpeechInput(false);
+      if (transcript) {
+        const attachmentsToSend = attachments;
+        const imageUriToSend = imageAttachment?.uri;
+        clearAll({ cleanupSources: false });
+        setSendInFlight(true);
+        setSendPending(true);
+        settleSend(
+          onSend(transcript, imageUriToSend, attachmentsToSend),
+          transcript,
+          attachmentsToSend
+        );
+        Keyboard.dismiss();
+      }
+    };
+
+    return (
+      <View style={containerStyle} onLayout={handleBarLayoutForPadding}>
+        <ChatSpeechInput
+          onSubmit={handleSubmit}
+          onCancel={() => setShowSpeechInput(false)}
+          onInterrupted={(heard) => {
+            setShowSpeechInput(false);
+            if (!heard) return;
+            setUserInput((current) =>
+              current ? `${current} ${heard}` : heard
+            );
+            Toast.show({
+              type: 'defaultToast',
+              text1: 'Dictation stopped. What it heard is in the message box.',
+            });
+          }}
+        />
+      </View>
+    );
+  }
+
+  if (chatId && model && retiredBy && !model.isDownloaded) {
+    return (
+      <View style={containerStyle} onLayout={handleBarLayoutForPadding}>
+        <ModelUpdateBanner model={model} replaces={retiredBy} />
+      </View>
+    );
+  }
+
+  if (chatId && !model?.isDownloaded) {
+    return (
+      <View style={containerStyle} onLayout={handleBarLayoutForPadding}>
+        <ModelUnavailableCard
+          model={model}
+          pendingModel={pendingModel}
+          onPress={onSelectModel}
+        />
+      </View>
+    );
+  }
+
+  return (
+    <Animated.View
+      testID="chat-bar"
+      style={containerStyle}
+      onLayout={handleBarLayoutForPadding}
+      layout={hasMessages ? BAR_GROW_LAYOUT : undefined}
+    >
+      {model?.isDownloaded && (
+        <>
+          {!hasMessages && (
+            <Animated.View
+              style={styles.suggestionsContainer}
+              exiting={FadeOut.duration(GRADIENT_EXIT_MS)}
+            >
+              <PromptSuggestions
+                onSelectPrompt={onSelectPrompt}
+                paused={promptsPaused}
+              />
+            </Animated.View>
+          )}
+          <Glass
+            radius={COMPOSER_CARD_RADIUS}
+            interactive={false}
+            fallbackTint={theme.bg.chatBar}
+            style={styles.inputContainer}
+          >
+            <Animated.View
+              pointerEvents={attachments.length ? 'auto' : 'none'}
+              style={[styles.strip, stripStyle]}
+            >
+              <View style={styles.stripRow}>
+                {attachments.map((attachment) => (
+                  <Animated.View
+                    key={attachment.id}
+                    exiting={FadeOut.duration(BAR_GROW_DURATION)}
+                    layout={BAR_GROW_LAYOUT}
+                  >
+                    <View
+                      style={
+                        pendingIds.includes(attachment.id)
+                          ? styles.stripPending
+                          : undefined
+                      }
+                    >
+                      <AttachmentThumbnail
+                        attachment={attachment}
+                        onRemove={() => removeAttachment(attachment.id)}
+                      />
+                    </View>
+                  </Animated.View>
+                ))}
+              </View>
+            </Animated.View>
+            <View
+              style={styles.belowStrip}
+              onLayout={handleRowsBelowStripLayout}
+            >
+              {showIndexChip && (
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.indexUrlChip,
+                    pressed && pressedOpacity,
+                  ]}
+                  onPress={handleIndexUrl}
+                  testID="index-url-chip"
+                >
+                  <LinkIcon
+                    width={16}
+                    height={16}
+                    style={{ color: theme.text.onChatBar }}
+                  />
+                  <Text style={styles.indexUrlChipText} numberOfLines={1}>
+                    Index {hostname(detectedUrl!)}
+                  </Text>
+                </Pressable>
+              )}
+              <View style={styles.content}>
+                <TextInputWrapper
+                  onPaste={onPaste}
+                  style={styles.textInputWrapper}
+                >
+                  <RNTextInput
+                    {...TEXT_SELECTION}
+                    key={Platform.OS === 'ios' ? iosInputKey : undefined}
+                    ref={textInputRef}
+                    style={styles.input}
+                    multiline
+                    numberOfLines={3}
+                    onFocus={() => loadSelectedModel()}
+                    placeholder="Ask anything"
+                    placeholderTextColor={theme.text.onChatBarMuted}
+                    value={userInput}
+                    editable={!isHoldingInput}
+                    onChangeText={handleChangeText}
+                  />
+                </TextInputWrapper>
+              </View>
+              <ChatBarActions
+                plusOut={panel.plusOut}
+                sendPending={sendPending}
+                sendInFlight={sendInFlight}
+                onAttach={handleAttach}
+                onAttachPressIn={panel.onPlusPressIn}
+                onAttachPressOut={panel.onPlusPressOut}
+                hasAttachments={attachments.length > 0}
+                isLoadingAttachment={hasLoadingAttachment}
+                userInput={userInput}
+                onSend={handleSend}
+                isGenerating={isGeneratingHere}
+                isProcessingPrompt={isProcessingPromptHere}
+                onInterrupt={interrupt}
+                onSpeechInput={openSpeechInput}
+                model={model}
+                pendingModel={pendingModel}
+                onSelectModel={onSelectModel}
+                modelLocked={modelLocked}
+                thinkingEnabled={thinkingEnabled}
+                onThinkingToggle={onThinkingToggle}
+                webSearchEnabled={webSearchEnabled}
+                onWebSearchToggle={webSearchToggle}
+              />
+            </View>
+          </Glass>
+          <AttachmentOverlay
+            panel={panel}
+            onWindowHeight={setPanelWindowHeight}
+            busyAction={filesBusy ? 'files' : null}
+            width={screenWidth}
+            gridWidth={gridWidth}
+            gridHeight={gridHeight}
+            menuMaxBottom={menuMaxBottom}
+            sheetTop={sheetTop}
+            sheetBottom={sheetBottom}
+            composerBottom={composerBottom}
+            rowsBelowStrip={rowsBelowStrip}
+            strip={strip}
+            attach={attach}
+            flights={flights}
+            isFlying={isFlying}
+            attachAndLeave={attachAndLeave}
+            attachedIds={attachments.map((attachment) => attachment.id)}
+            maxSelection={MAX_IMAGE_ATTACHMENTS}
+            imagesEnabled={isVisionModel}
+            attachmentsBlocked={isRespondingHere}
+            tools={menuTools}
+          />
+          <EmbeddingDownloadSheet
+            bottomSheetModalRef={embeddingDownloadSheetRef}
+            onDownload={downloadModelAndContinue}
+            onDismiss={handleEmbeddingSheetDismiss}
+            context={embeddingSheetContext}
+            required={embeddingSheetRequired}
+          />
+        </>
+      )}
+    </Animated.View>
+  );
+};
+
+export default memo(ChatBar);
+
+const createStyles = (theme: Theme) =>
+  StyleSheet.create({
+    container: {
+      flexDirection: 'column',
+      justifyContent: 'center',
+      paddingHorizontal: space.four,
+      flexShrink: 1,
+    },
+    suggestionsContainer: {
+      flexShrink: 1,
+      marginBottom: space.four,
+    },
+    content: {
+      flexDirection: 'row',
+      width: '100%',
+      marginBottom: COMPOSER.inputGapBelow,
+    },
+    inputContainer: {
+      flexDirection: 'column',
+      padding: COMPOSER.cardPadding,
+      paddingTop: COMPOSER.cardPaddingTop,
+      justifyContent: 'center',
+    },
+    textInputWrapper: {
+      flex: 1,
+    },
+    input: {
+      fontSize: fontSizes.lg,
+      // lineHeight on Android causes typed text to be taller than the
+      // placeholder, making the ChatBar jump on first keystroke.
+      ...(Platform.OS === 'ios'
+        ? { lineHeight: lineHeights.lg }
+        : { includeFontPadding: false }),
+      fontFamily: fontFamily.regular,
+      textAlignVertical: 'center',
+      paddingHorizontal: space.one,
+      color: theme.text.onChatBar,
+    },
+    strip: {
+      overflow: 'hidden',
+    },
+    stripRow: {
+      position: 'absolute',
+      left: 0,
+      right: 0,
+      top: COMPOSER.stripPaddingTop,
+      flexDirection: 'row',
+      gap: COMPOSER.thumbGap,
+    },
+    stripPending: {
+      opacity: 0,
+    },
+    belowStrip: {
+      gap: space.two,
+    },
+    indexUrlChip: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      alignSelf: 'flex-start',
+      gap: 6,
+      paddingVertical: 6,
+      paddingHorizontal: space.twoHalf,
+      borderRadius: radius.full,
+      borderWidth: stroke.soft,
+      borderColor: theme.text.onChatBar,
+      marginBottom: space.two,
+      maxWidth: '100%',
+    },
+    indexUrlChipText: {
+      color: theme.text.onChatBar,
+      fontSize: fontSizes.sm,
+      fontFamily: fontFamily.regular,
+      flexShrink: 1,
+    },
+  });

@@ -1,0 +1,162 @@
+import React from 'react';
+import { View, Text, Pressable, StyleSheet, Platform } from 'react-native';
+import * as DocumentPicker from 'expo-document-picker';
+import Folder from '../assets/icons/folder.svg';
+import TrashIcon from '../assets/icons/trash.svg';
+import AttachmentIcon from '../assets/icons/attachment.svg';
+import { useThemedStyles } from '../hooks/useThemedStyles';
+import { fontFamily, fontSizes } from '../styles/fontStyles';
+import { Theme } from '../styles/colors';
+import { DIMMED_OPACITY, pressedOpacity } from '../styles/pressable';
+import { radius, space, stroke } from '../constants/design-system';
+
+interface Props {
+  fileInfo: { name: string; size: number | null; uri: string } | null;
+  onChange: (
+    file: { name: string; size: number | null; uri: string } | null
+  ) => void;
+  disabled?: boolean;
+}
+
+const formatFileSize = (bytes: number | null) => {
+  if (!bytes || isNaN(bytes)) return '';
+  const kb = bytes / 1024;
+  const mb = kb / 1024;
+  const gb = mb / 1024;
+  if (gb >= 1) return `${gb.toFixed(1)} GB`;
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  if (kb >= 1) return `${kb.toFixed(1)} KB`;
+  return `${bytes} B`;
+};
+
+const UploadInput = ({ fileInfo, onChange, disabled = false }: Props) => {
+  const { styles } = useThemedStyles(createStyles, disabled);
+
+  const handlePickFile = async () => {
+    const result = await DocumentPicker.getDocumentAsync({
+      type: '*/*',
+      copyToCacheDirectory: false,
+    });
+
+    if (!result.canceled && result.assets[0]) {
+      const asset = result.assets[0];
+      const uri = asset.uri || '';
+      const normalizedUri =
+        Platform.OS === 'ios' ? uri.replace('file://', '') : uri;
+
+      onChange({
+        name: asset.name || asset.uri.split('/').pop() || 'Unnamed',
+        size: asset.size || null,
+        uri: normalizedUri,
+      });
+    }
+  };
+
+  return (
+    <View>
+      {!fileInfo ? (
+        <View style={styles.emptyBox}>
+          <Pressable
+            style={({ pressed }) => [
+              styles.selectButton,
+              pressed && pressedOpacity,
+            ]}
+            onPress={handlePickFile}
+            disabled={disabled}
+          >
+            <Folder width={16.67} height={14.17} style={styles.iconContrast} />
+            <Text style={styles.selectButtonText}>Select a file</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <View style={styles.fileBox}>
+          <View style={styles.fileInfo}>
+            <AttachmentIcon
+              width={15.83}
+              height={15.83}
+              style={styles.iconPrimary}
+            />
+            <Text style={styles.fileText}>{fileInfo.name}</Text>
+            {fileInfo.size ? (
+              <Text style={styles.fileTextSecondary}>
+                ({formatFileSize(fileInfo.size)})
+              </Text>
+            ) : null}
+          </View>
+          {!disabled && (
+            <Pressable
+              onPress={() => onChange(null)}
+              style={({ pressed }) => pressed && pressedOpacity}
+            >
+              <TrashIcon width={20} height={20} style={styles.iconPrimary} />
+            </Pressable>
+          )}
+        </View>
+      )}
+    </View>
+  );
+};
+
+export default UploadInput;
+
+const createStyles = (theme: Theme, disabled: boolean) =>
+  StyleSheet.create({
+    emptyBox: {
+      height: 80,
+      borderWidth: stroke.soft,
+      borderStyle: 'dashed',
+      borderRadius: radius.twelve,
+      paddingVertical: space.twoHalf,
+      paddingHorizontal: space.three,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderColor: theme.border.soft,
+    },
+    selectButton: {
+      height: 40,
+      borderRadius: radius.full,
+      paddingHorizontal: space.twoHalf,
+      flexDirection: 'row',
+      justifyContent: 'center',
+      alignItems: 'center',
+      backgroundColor: theme.bg.main,
+    },
+    selectButtonText: {
+      paddingHorizontal: space.one,
+      fontFamily: fontFamily.medium,
+      fontSize: fontSizes.sm,
+      color: theme.text.contrastPrimary,
+    },
+    fileBox: {
+      borderRadius: radius.twelve,
+      paddingVertical: space.four,
+      paddingHorizontal: space.three,
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: space.two,
+      backgroundColor: theme.bg.softSecondary,
+      opacity: disabled ? DIMMED_OPACITY : 1,
+    },
+    fileInfo: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.two,
+    },
+    fileText: {
+      fontFamily: fontFamily.regular,
+      fontSize: fontSizes.sm,
+      color: theme.text.primary,
+    },
+    fileTextSecondary: {
+      fontFamily: fontFamily.regular,
+      fontSize: fontSizes.sm,
+      color: theme.text.defaultSecondary,
+    },
+    iconPrimary: {
+      color: theme.text.primary,
+    },
+    iconContrast: {
+      color: theme.text.contrastPrimary,
+    },
+  });

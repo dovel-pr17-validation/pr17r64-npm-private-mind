@@ -1,0 +1,261 @@
+import { type SQLiteDatabase } from 'expo-sqlite';
+import { getActiveCatalog } from '../utils/modelCatalogState';
+import { runnerCanLoad } from '../constants/model-exports';
+
+export type Model = {
+  id: number;
+  modelName: string;
+  source: 'local' | 'remote' | 'built-in';
+  isDownloaded: boolean;
+  modelPath: string;
+  tokenizerPath: string;
+  tokenizerConfigPath: string;
+  family?: string;
+  featured?: boolean;
+  experimental?: boolean;
+  thinking?: boolean;
+  vision?: boolean;
+  labels?: string[];
+  parameters?: number;
+  modelSize?: number;
+  systemPrompt?: string | null;
+  outdatedSources?: string[];
+  updateRequired?: boolean;
+  latestSources?: ModelSources;
+};
+
+export type ModelSources = Pick<
+  Model,
+  'modelPath' | 'tokenizerPath' | 'tokenizerConfigPath'
+>;
+
+export const addModel = async (
+  db: SQLiteDatabase,
+  model: Omit<Model, 'id'>
+): Promise<number> => {
+  const result = await db.runAsync(
+    `
+    INSERT OR IGNORE INTO models (
+      modelName,
+      isDownloaded,
+      source,
+      modelPath,
+      tokenizerPath,
+      tokenizerConfigPath,
+      family,
+      parameters,
+      modelSize,
+      featured,
+      experimental,
+      thinking,
+      vision,
+      labels,
+      systemPrompt
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `,
+    [
+      model.modelName,
+      model.isDownloaded ? 1 : 0,
+      model.source || 'remote',
+      model.modelPath,
+      model.tokenizerPath,
+      model.tokenizerConfigPath,
+      model.family || null,
+      model.parameters || null,
+      model.modelSize || null,
+      model.featured ? 1 : 0,
+      model.experimental ? 1 : 0,
+      model.thinking ? 1 : 0,
+      model.vision ? 1 : 0,
+      model.labels ? JSON.stringify(model.labels) : null,
+      model.systemPrompt || null,
+    ]
+  );
+
+  return result.lastInsertRowId;
+};
+
+export const updateModelDownloaded = async (
+  db: SQLiteDatabase,
+  id: number,
+  downloadedStatus: number
+) => {
+  await db.runAsync(
+    `
+    UPDATE models
+    SET isDownloaded = ?
+    WHERE id = ?
+  `,
+    [downloadedStatus, id]
+  );
+};
+
+export const removeModelFiles = async (db: SQLiteDatabase, id: number) => {
+  await db.runAsync(`DELETE FROM models WHERE id = ?`, [id]);
+};
+
+export const syncBuiltInModelPaths = async (
+  db: SQLiteDatabase,
+  id: number,
+  modelName: string
+) => {
+  const defaults = getActiveCatalog().find((m) => m.modelName === modelName);
+  if (!defaults) return;
+
+  await db.runAsync(
+    `
+    UPDATE models
+    SET modelPath = ?, tokenizerPath = ?, tokenizerConfigPath = ?, modelSize = ?
+    WHERE id = ? AND source = 'built-in'
+  `,
+    [
+      defaults.modelPath,
+      defaults.tokenizerPath,
+      defaults.tokenizerConfigPath,
+      defaults.modelSize ?? null,
+      id,
+    ]
+  );
+};
+
+type RawModel = Omit<
+  Model,
+  | 'isDownloaded'
+  | 'featured'
+  | 'experimental'
+  | 'thinking'
+  | 'vision'
+  | 'labels'
+> & {
+  isDownloaded: number;
+  featured: number;
+  experimental: number;
+  thinking: number;
+  vision: number;
+  labels: string | null;
+  systemPrompt: string | null;
+};
+
+const parseLabels = (raw: string | null): string[] | undefined => {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const sourcesTheCatalogReplaced = (
+  model: RawModel,
+  defaults: Pick<
+    Model,
+    'modelPath' | 'tokenizerPath' | 'tokenizerConfigPath'
+  > | null
+): string[] => {
+  if (!defaults || model.isDownloaded !== 1) return [];
+  const pairs: [string, string][] = [
+    [model.modelPath, defaults.modelPath],
+    [model.tokenizerPath, defaults.tokenizerPath],
+    [model.tokenizerConfigPath, defaults.tokenizerConfigPath],
+  ];
+  return pairs
+    .filter(([stored, current]) => stored !== current)
+    .map(([stored]) => stored);
+};
+
+const hydrateModel = (model: RawModel): Model => {
+  const defaults =
+    model.source === 'built-in'
+      ? getActiveCatalog().find((m) => m.modelName === model.modelName)
+      : undefined;
+  const outdatedSources = sourcesTheCatalogReplaced(model, defaults ?? null);
+  const updateRequired = outdatedSources.some(
+    (source) => !runnerCanLoad(source)
+  );
+  const stored: ModelSources = {
+    modelPath: model.modelPath,
+    tokenizerPath: model.tokenizerPath,
+    tokenizerConfigPath: model.tokenizerConfigPath,
+  };
+  const latest: ModelSources = {
+    modelPath: defaults?.modelPath ?? model.modelPath,
+    tokenizerPath: defaults?.tokenizerPath ?? model.tokenizerPath,
+    tokenizerConfigPath:
+      defaults?.tokenizerConfigPath ?? model.tokenizerConfigPath,
+  };
+  const keepsStoredFiles = outdatedSources.length > 0 && !updateRequired;
+
+  return {
+    ...model,
+    ...(outdatedSources.length > 0 && {
+      outdatedSources,
+      updateRequired,
+      latestSources: latest,
+    }),
+    ...(keepsStoredFiles ? stored : latest),
+    modelSize: defaults?.modelSize ?? model.modelSize,
+    family: defaults?.family ?? model.family ?? undefined,
+    isDownloaded: model.isDownloaded === 1,
+    featured: model.featured === 1,
+    experimental: model.experimental === 1,
+    thinking: model.thinking === 1,
+    vision: model.vision === 1,
+    labels: parseLabels(model.labels),
+    systemPrompt: model.systemPrompt ?? null,
+  };
+};
+
+export const getAllModels = async (
+  db: Pick<SQLiteDatabase, 'getAllAsync'>
+): Promise<Model[]> => {
+  const rawModels = await db.getAllAsync<RawModel>(
+    `SELECT * FROM models ORDER BY featured DESC`
+  );
+  return rawModels.map(hydrateModel);
+};
+
+export const updateModel = async (
+  db: SQLiteDatabase,
+  {
+    modelId,
+    tokenizerPath,
+    tokenizerConfigPath,
+    newModelName,
+  }: {
+    modelId: number;
+    tokenizerPath: string;
+    tokenizerConfigPath: string;
+    newModelName: string;
+  }
+) => {
+  await db.runAsync(
+    `
+    UPDATE models
+    SET modelName = ?, tokenizerPath = ?, tokenizerConfigPath = ?
+    WHERE id = ?
+  `,
+    [newModelName, tokenizerPath, tokenizerConfigPath, modelId]
+  );
+};
+
+export const getModelsByNames = async (
+  db: Pick<SQLiteDatabase, 'getAllAsync'>,
+  modelNames: string[]
+) => {
+  if (modelNames.length === 0) {
+    return [];
+  }
+
+  const placeholders = modelNames.map(() => '?').join(', ');
+  const rawModels = await db.getAllAsync<RawModel>(
+    `SELECT * FROM models WHERE modelName IN (${placeholders})`,
+    modelNames
+  );
+  return rawModels
+    .map(hydrateModel)
+    .sort(
+      (a, b) =>
+        modelNames.indexOf(a.modelName) - modelNames.indexOf(b.modelName)
+    );
+};

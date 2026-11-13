@@ -1,0 +1,131 @@
+import React, { useMemo, useRef } from 'react';
+import {
+  BottomSheetModal,
+  BottomSheetModalProvider,
+} from '@gorhom/bottom-sheet';
+import { StyleSheet, Text, View } from 'react-native';
+import { ScrollView } from 'react-native-gesture-handler';
+import { useRouter } from 'expo-router';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import { useActiveDownloads } from '../../hooks/useActiveDownloads';
+import { Theme } from '../../styles/colors';
+import { useModelStore } from '../../store/modelStore';
+import { Model } from '../../database/modelRepository';
+import GlassScreenHeader, {
+  useGlassScreenHeaderHeight,
+} from '../../components/GlassScreenHeader';
+import RowGroup from '../../components/model-hub/RowGroup';
+import ModelManagementSheet from '../../components/bottomSheets/ModelManagementSheet';
+import ModelDownloadRow from '../../components/model-hub/ModelDownloadRow';
+import SectionHeader from '../../components/model-hub/SectionHeader';
+import { scrollIndicatorProps } from '../../constants/scroll-indicator';
+import {
+  radius,
+  space,
+  stroke,
+  textStyles,
+} from '../../constants/design-system';
+
+const DownloadsScreen = () => {
+  const router = useRouter();
+  const headerHeight = useGlassScreenHeaderHeight(true);
+  const { styles } = useThemedStyles(createStyles, headerHeight);
+  const modelManagementSheetRef = useRef<BottomSheetModal<Model> | null>(null);
+
+  const models = useModelStore((state) => state.models);
+  const downloading = useActiveDownloads();
+  const onDevice = useMemo(
+    () => models.filter((m) => m.isDownloaded && m.source !== 'local'),
+    [models]
+  );
+  const usedGB = onDevice.reduce((sum, m) => sum + (m.modelSize ?? 0), 0);
+
+  const openModel = (model: Model) =>
+    modelManagementSheetRef.current?.present(model);
+
+  return (
+    <BottomSheetModalProvider>
+      <View style={styles.container}>
+        <ScrollView
+          style={styles.scrollView}
+          contentContainerStyle={styles.scrollContent}
+          {...scrollIndicatorProps(headerHeight)}
+        >
+          {downloading.length > 0 && (
+            <View style={styles.section}>
+              <SectionHeader title={`Downloading · ${downloading.length}`} />
+              <RowGroup separatorInset={0}>
+                {downloading.map(({ model }) => (
+                  <ModelDownloadRow
+                    key={model.id}
+                    model={model}
+                    onPress={openModel}
+                    showFamilyTile
+                  />
+                ))}
+              </RowGroup>
+            </View>
+          )}
+          <View style={styles.section}>
+            <SectionHeader
+              title={`On this device · ${onDevice.length}`}
+              summary={`${usedGB.toFixed(2)} GB used`}
+            />
+            {onDevice.length > 0 ? (
+              <RowGroup separatorInset={0}>
+                {onDevice.map((model) => (
+                  <ModelDownloadRow
+                    key={model.id}
+                    model={model}
+                    onPress={openModel}
+                    showFamilyTile
+                  />
+                ))}
+              </RowGroup>
+            ) : (
+              <Text style={styles.empty}>No models on this device yet.</Text>
+            )}
+          </View>
+        </ScrollView>
+        <GlassScreenHeader
+          title="Downloads"
+          onBack={() => router.back()}
+          sheet
+        />
+        <ModelManagementSheet bottomSheetModalRef={modelManagementSheetRef} />
+      </View>
+    </BottomSheetModalProvider>
+  );
+};
+
+export default DownloadsScreen;
+
+const createStyles = (theme: Theme, headerHeight: number) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.bg.softPrimary,
+    },
+    scrollView: {
+      flex: 1,
+    },
+    scrollContent: {
+      gap: space.six,
+      paddingTop: headerHeight + space.six,
+      paddingHorizontal: space.four,
+      paddingBottom: theme.insets.bottom + space.four,
+    },
+    section: {
+      gap: space.two,
+    },
+    empty: {
+      padding: space.four,
+      borderRadius: radius.eighteen,
+      borderWidth: stroke.soft,
+      borderStyle: 'dashed',
+      borderColor: theme.border.soft,
+      ...textStyles.bodySecondaryRegular,
+      textAlign: 'center',
+      color: theme.text.defaultTertiary,
+    },
+  });

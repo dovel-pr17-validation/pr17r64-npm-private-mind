@@ -1,0 +1,557 @@
+import React, {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import {
+  View,
+  StyleSheet,
+  Text,
+  Image,
+  Pressable,
+  Linking,
+  PixelRatio,
+  LayoutChangeEvent,
+  useWindowDimensions,
+} from 'react-native';
+import Animated, { FadeIn, FadeOut } from 'react-native-reanimated';
+import ThinkingBlock from './ThinkingBlock';
+import AnimatedChatLoading from './AnimatedChatLoading';
+import WebSearchBlock from './WebSearchBlock';
+import GroundingCaveatBadges from './GroundingCaveatBadges';
+import AttributedAnswer from './AttributedAnswer';
+import { attributeSourcesByBlock } from '../../utils/attributeSources';
+import DominantSourceBadge from './DominantSourceBadge';
+import { WEB_TRACE_TRANSITION_MS } from './webSearchTraceConstants';
+import { fontFamily, fontSizes, lineHeights } from '../../styles/fontStyles';
+import { useThemedStyles } from '../../hooks/useThemedStyles';
+import { useWebSearchActivity } from '../../hooks/useWebSearchActivity';
+import { useMessageSources } from '../../hooks/useMessageSources';
+import { useSettingsStore } from '../../store/settingsStore';
+import { Theme } from '../../styles/colors';
+import ImageLightbox from './ImageLightbox';
+import AttachmentIcon from '../../assets/icons/attachment.svg';
+import BookIcon from '../../assets/icons/book-open.svg';
+import CopyIcon from '../../assets/icons/copy.svg';
+import ForkIcon from '../../assets/icons/fork.svg';
+import MessageActionButton from './MessageActionButton';
+import {
+  MESSAGE_ACTION_ROW_HEIGHT,
+  SUPPORTS_USER_ACTION_MENU,
+  MESSAGE_LIST_SIDE_PADDING,
+} from '../../constants/chat-screen';
+import { Message, type SourceDocument } from '../../database/chatRepository';
+import { retrievalStatsLines } from '../../utils/retrievalStatsLine';
+import { parseThinkingContent, stripThinkMarkers } from '../../utils/thinking';
+import { stripSpecialTokens } from '../../utils/specialTokens';
+import { pressedOpacity } from '../../styles/pressable';
+import { radius, space } from '../../constants/design-system';
+
+interface MessageItemProps {
+  message: Message;
+  content: string;
+  role: 'user' | 'assistant' | 'system' | 'event';
+  modelName?: string;
+  tokensPerSecond?: number;
+  timeToFirstToken?: number;
+  isLastMessage: boolean;
+  imagePath?: string;
+  documentName?: string;
+  sourceDocuments?: SourceDocument[];
+  userQuestion?: string;
+  onShowSources?: (sources: SourceDocument[], userQuestion?: string) => void;
+  showActions?: boolean;
+  showForkAction?: boolean;
+  onCopy?: (message: Message) => void;
+  onFork?: (message: Message) => void;
+}
+
+const splitDocumentName = (name: string) => {
+  const dotIndex = name.lastIndexOf('.');
+  const extension = dotIndex > 0 ? name.slice(dotIndex + 1) : '';
+
+  if (!extension || extension.length > 5) {
+    return { title: name, type: 'Document' };
+  }
+
+  return { title: name.slice(0, dotIndex), type: extension.toUpperCase() };
+};
+
+const REFINED_SWAP_MS = 320;
+
+export const MODEL_STARTING_LABEL = 'Starting the model on your device…';
+
+const useRefinedSwap = (isRefining: boolean): number => {
+  const [swap, setSwap] = useState(0);
+  const wasRefining = useRef(false);
+  useEffect(() => {
+    if (wasRefining.current && !isRefining) setSwap((count) => count + 1);
+    wasRefining.current = isRefining;
+  }, [isRefining]);
+  return swap;
+};
+
+const USER_BUBBLE_WIDTH_SHARE = 0.65;
+const IMAGE_PRESSED_OPACITY = 0.9;
+
+const bubbleWidthOnPixelGrid = (rowWidth: number) => {
+  const pixelsPerPoint = PixelRatio.get();
+  return (
+    Math.floor(rowWidth * USER_BUBBLE_WIDTH_SHARE * pixelsPerPoint) /
+    pixelsPerPoint
+  );
+};
+
+const MessageItem = memo(
+  ({
+    message,
+    content,
+    modelName,
+    role,
+    tokensPerSecond,
+    timeToFirstToken,
+    isLastMessage = false,
+    imagePath,
+    documentName,
+    sourceDocuments,
+    userQuestion,
+    onShowSources,
+    showActions = false,
+    showForkAction = false,
+    onCopy,
+    onFork,
+  }: MessageItemProps) => {
+    const { styles } = useThemedStyles(createStyles);
+    const showPerformanceMetrics = useSettingsStore(
+      (state) => state.showPerformanceMetrics
+    );
+    const [lightboxVisible, setLightboxVisible] = useState(false);
+    const [userRowWidth, setUserRowWidth] = useState<number | null>(null);
+    const handleUserRowLayout = useCallback(
+      (event: LayoutChangeEvent) =>
+        setUserRowWidth(event.nativeEvent.layout.width),
+      []
+    );
+    const { width: windowWidth } = useWindowDimensions();
+    const userBubbleWidth = useMemo(
+      () => ({
+        maxWidth: bubbleWidthOnPixelGrid(
+          userRowWidth ?? windowWidth - 2 * MESSAGE_LIST_SIDE_PADDING
+        ),
+      }),
+      [userRowWidth, windowWidth]
+    );
+
+    const visibleContent = useMemo(
+      () => (role === 'assistant' ? stripSpecialTokens(content) : content),
+      [content, role]
+    );
+    const contentParts = useMemo(
+      () => parseThinkingContent(visibleContent),
+      [visibleContent]
+    );
+    const userText = useMemo(
+      () => stripThinkMarkers(visibleContent),
+      [visibleContent]
+    );
+    const {
+      displayedSources,
+      webResults,
+      documentSources,
+      dominantWebSource,
+      hasSources,
+    } = useMessageSources(sourceDocuments);
+
+    const documentInfo = useMemo(
+      () => (documentName ? splitDocumentName(documentName) : null),
+      [documentName]
+    );
+
+    const handleLinkPress = useCallback(({ url }: { url: string }) => {
+      if (!/^https?:\/\//i.test(url) && !/^mailto:/i.test(url)) return;
+      Linking.openURL(url).catch(() => {});
+    }, []);
+
+    const normalContent = contentParts.normalContent;
+    const normalAfterThink = contentParts.normalAfterThink ?? '';
+
+    const {
+      isGenerating,
+      isBusy,
+      isRefining,
+      isSearchingThis,
+      isAwaitingFirstToken,
+      isModelStarting,
+      trace: webSearchTrace,
+      webActive,
+    } = useWebSearchActivity({
+      isLastMessage,
+      content,
+      hasWebResults: webResults.length > 0,
+    });
+    const refinedSwap = useRefinedSwap(isRefining);
+    const attributionShown = useMemo(() => {
+      if (isLastMessage && isGenerating) return false;
+      return [contentParts.normalContent, contentParts.normalAfterThink ?? '']
+        .filter((part) => part.trim())
+        .some((part) =>
+          attributeSourcesByBlock(part, webResults).some(
+            (block) => block.source
+          )
+        );
+    }, [
+      contentParts.normalContent,
+      contentParts.normalAfterThink,
+      isGenerating,
+      isLastMessage,
+      webResults,
+    ]);
+
+    const canShowSourcesAction =
+      !!content.trim() && documentSources.length > 0 && !isBusy;
+
+    const answerIsIncomplete =
+      !!message.stoppedByUser || !!message.cutShortReason;
+
+    const actions =
+      !answerIsIncomplete && (showActions || canShowSourcesAction) ? (
+        <View style={styles.actionRow} testID="message-actions">
+          {showActions && (
+            <MessageActionButton
+              label="Copy"
+              icon={CopyIcon}
+              onPress={() => onCopy?.(message)}
+            />
+          )}
+          {showActions && showForkAction && (
+            <MessageActionButton
+              label="Fork"
+              icon={ForkIcon}
+              onPress={() => onFork?.(message)}
+            />
+          )}
+          {canShowSourcesAction && (
+            <Pressable
+              style={({ pressed }) => [
+                styles.sourcesButton,
+                pressed && pressedOpacity,
+              ]}
+              onPress={() => onShowSources?.(displayedSources, userQuestion)}
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Sources"
+              testID="source-action-button"
+            >
+              <BookIcon
+                width={16}
+                height={16}
+                style={styles.sourcesButtonIcon}
+              />
+              <Text style={styles.sourcesButtonLabel}>Sources</Text>
+            </Pressable>
+          )}
+        </View>
+      ) : null;
+
+    return (
+      <>
+        {role === 'event' ? (
+          <View style={styles.eventMessage}>
+            <Text style={styles.eventMessageFileName}>
+              {content.split(' ')[0]}{' '}
+              <Text style={styles.eventMessageText}>
+                {content.slice(content.indexOf(' ') + 1)}
+              </Text>
+            </Text>
+          </View>
+        ) : role === 'user' ? (
+          <View style={styles.userMessageGroup} onLayout={handleUserRowLayout}>
+            {imagePath && (
+              <View
+                style={[styles.userBubble, userBubbleWidth]}
+                testID="image-bubble"
+              >
+                <Pressable
+                  onPress={() => setLightboxVisible(true)}
+                  style={({ pressed }) => pressed && styles.imagePressed}
+                >
+                  <Image
+                    source={{ uri: imagePath }}
+                    style={styles.messageImage}
+                    resizeMode="cover"
+                    testID="message-image"
+                  />
+                </Pressable>
+                <ImageLightbox
+                  uri={imagePath}
+                  visible={lightboxVisible}
+                  onClose={() => setLightboxVisible(false)}
+                />
+              </View>
+            )}
+            {documentName && (
+              <View style={styles.documentCard} testID="document-bubble">
+                <AttachmentIcon
+                  width={22}
+                  height={22}
+                  style={styles.documentIcon}
+                />
+                <View style={styles.documentMeta} testID="message-document">
+                  <Text style={styles.documentName} numberOfLines={1}>
+                    {documentInfo?.title}
+                  </Text>
+                  <Text style={styles.documentType} numberOfLines={1}>
+                    {documentInfo?.type}
+                  </Text>
+                </View>
+              </View>
+            )}
+            {userText.trim() && (
+              <View
+                style={[styles.userBubble, userBubbleWidth]}
+                testID="text-bubble"
+              >
+                <View style={styles.userMessageContent}>
+                  <Text
+                    style={styles.userText}
+                    selectable={!SUPPORTS_USER_ACTION_MENU}
+                  >
+                    {userText.trim()}
+                  </Text>
+                </View>
+              </View>
+            )}
+          </View>
+        ) : (
+          <View style={styles.aiMessage}>
+            <View style={styles.bubbleContent}>
+              {content.trim() || isAwaitingFirstToken ? (
+                <Animated.Text
+                  style={styles.modelName}
+                  entering={FadeIn.duration(WEB_TRACE_TRANSITION_MS)}
+                >
+                  {modelName}
+                </Animated.Text>
+              ) : null}
+              {webActive && (
+                <WebSearchBlock
+                  isSearching={isSearchingThis}
+                  trace={webSearchTrace}
+                  results={webResults}
+                />
+              )}
+              {isAwaitingFirstToken ? (
+                <AnimatedChatLoading
+                  label={isModelStarting ? MODEL_STARTING_LABEL : 'Generating…'}
+                />
+              ) : null}
+              <Animated.View
+                key={refinedSwap}
+                entering={
+                  refinedSwap > 0 ? FadeIn.duration(REFINED_SWAP_MS) : undefined
+                }
+                exiting={FadeOut.duration(REFINED_SWAP_MS / 2)}
+              >
+                {contentParts.normalContent.trim() && (
+                  <AttributedAnswer
+                    text={normalContent}
+                    sources={webResults}
+                    hasSources={hasSources}
+                    streaming={isLastMessage && isGenerating}
+                    onLinkPress={handleLinkPress}
+                  />
+                )}
+                {contentParts.hasThinking &&
+                  contentParts.thinkingContent?.trim() && (
+                    <ThinkingBlock
+                      content={contentParts.thinkingContent || ''}
+                      isComplete={contentParts.isThinkingComplete}
+                      inProgress={
+                        isLastMessage &&
+                        isGenerating &&
+                        !contentParts.isThinkingComplete
+                      }
+                    />
+                  )}
+                {contentParts.normalAfterThink &&
+                  contentParts.normalAfterThink.trim() && (
+                    <AttributedAnswer
+                      text={normalAfterThink}
+                      sources={webResults}
+                      hasSources={hasSources}
+                      streaming={isLastMessage && isGenerating}
+                      onLinkPress={handleLinkPress}
+                    />
+                  )}
+              </Animated.View>
+              {isRefining ? (
+                <Animated.View
+                  entering={FadeIn.duration(REFINED_SWAP_MS)}
+                  exiting={FadeOut.duration(REFINED_SWAP_MS / 2)}
+                >
+                  <AnimatedChatLoading label="Refining…" />
+                </Animated.View>
+              ) : null}
+              {attributionShown ? null : (
+                <DominantSourceBadge source={dominantWebSource} />
+              )}
+              <GroundingCaveatBadges caveats={message.groundingCaveats} />
+              {showPerformanceMetrics &&
+                retrievalStatsLines(message.retrievalStats).map((line) => (
+                  <Text key={line} style={styles.metadata}>
+                    {line}
+                  </Text>
+                ))}
+              {showPerformanceMetrics &&
+                tokensPerSecond !== undefined &&
+                tokensPerSecond !== 0 && (
+                  <Text style={styles.metadata}>
+                    ttft: {timeToFirstToken?.toFixed()} ms, tps:{' '}
+                    {tokensPerSecond?.toFixed(2)} tok/s
+                  </Text>
+                )}
+              {actions}
+            </View>
+          </View>
+        )}
+      </>
+    );
+  }
+);
+
+export default MessageItem;
+
+const createStyles = (theme: Theme) =>
+  StyleSheet.create({
+    aiMessage: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      marginBottom: space.six,
+      width: '90%',
+      alignSelf: 'flex-start',
+    },
+    userMessageGroup: {
+      alignItems: 'flex-end',
+      marginBottom: space.six,
+      gap: space.one,
+    },
+    userBubble: {
+      flexDirection: 'column',
+      alignItems: 'flex-start',
+      justifyContent: 'center',
+      maxWidth: `${USER_BUBBLE_WIDTH_SHARE * 100}%`,
+      borderRadius: radius.twelve,
+      backgroundColor: theme.bg.chatBar,
+      overflow: 'hidden',
+    },
+    userMessageContent: {
+      paddingHorizontal: space.three,
+      paddingVertical: space.two,
+      width: '100%',
+    },
+    messageImage: {
+      width: '100%',
+      aspectRatio: 4 / 3,
+    },
+    documentCard: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.twoHalf,
+      maxWidth: '75%',
+      paddingVertical: space.twoHalf,
+      paddingHorizontal: space.three,
+      borderRadius: 16,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border.soft,
+      backgroundColor: theme.bg.chatBar,
+    },
+    documentIcon: {
+      color: theme.text.defaultSecondary,
+    },
+    documentMeta: {
+      flexShrink: 1,
+      paddingRight: space.one,
+    },
+    documentName: {
+      fontFamily: fontFamily.medium,
+      fontSize: fontSizes.sm,
+      lineHeight: lineHeights.sm,
+      color: theme.text.primary,
+    },
+    documentType: {
+      fontFamily: fontFamily.medium,
+      fontSize: fontSizes.xxs,
+      lineHeight: lineHeights.xs,
+      letterSpacing: 0.8,
+      color: theme.text.defaultTertiary,
+    },
+    eventMessage: {
+      paddingHorizontal: space.four,
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginBottom: space.six,
+      flexDirection: 'row',
+    },
+    eventMessageFileName: {
+      fontFamily: fontFamily.medium,
+      fontSize: fontSizes.xs,
+      color: theme.text.defaultSecondary,
+      textAlign: 'center',
+    },
+    eventMessageText: {
+      fontFamily: fontFamily.regular,
+      fontSize: fontSizes.xs,
+      color: theme.text.defaultTertiary,
+      textAlign: 'center',
+    },
+    bubbleContent: {
+      width: '100%',
+      gap: space.one,
+    },
+    userText: {
+      fontFamily: fontFamily.regular,
+      fontSize: fontSizes.md,
+      color: theme.text.primary,
+      lineHeight: lineHeights.md,
+    },
+    modelName: {
+      fontSize: fontSizes.xs,
+      fontFamily: fontFamily.medium,
+      color: theme.text.defaultSecondary,
+    },
+    metadata: {
+      fontSize: fontSizes.xxs,
+      fontFamily: fontFamily.regular,
+      color: theme.text.defaultTertiary,
+    },
+    sourcesButton: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      paddingLeft: space.one,
+      paddingVertical: space.one,
+    },
+    sourcesButtonIcon: {
+      color: theme.text.primary,
+    },
+    sourcesButtonLabel: {
+      fontSize: fontSizes.sm,
+      lineHeight: 16,
+      fontFamily: fontFamily.medium,
+      color: theme.text.primary,
+      includeFontPadding: false,
+    },
+    actionRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      marginTop: space.one,
+      minHeight: MESSAGE_ACTION_ROW_HEIGHT,
+    },
+    imagePressed: {
+      opacity: IMAGE_PRESSED_OPACITY,
+    },
+  });

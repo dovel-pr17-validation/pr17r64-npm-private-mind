@@ -1,0 +1,164 @@
+import { SQLiteDatabase } from 'expo-sqlite';
+import { Message, persistMessage } from './chatRepository';
+
+export interface Source {
+  id: number;
+  name: string;
+  type: string;
+  size: number | null;
+  firstChunk?: string;
+  isProcessing?: boolean;
+}
+
+export const insertSource = async (
+  db: SQLiteDatabase,
+  source: Omit<Source, 'id'>
+): Promise<number> => {
+  const result = await db.runAsync(
+    `INSERT INTO sources (
+      name,
+      type,
+      size,
+      firstChunk
+    ) VALUES (?, ?, ?, ?)`,
+    [source.name, source.type, source.size, source.firstChunk || null]
+  );
+
+  return result.lastInsertRowId!;
+};
+
+export const findMatchingSource = async (
+  db: SQLiteDatabase,
+  source: Pick<Source, 'type' | 'size' | 'firstChunk'>
+): Promise<Source | null> =>
+  db.getFirstAsync<Source>(
+    `SELECT *
+       FROM sources
+      WHERE type = ?
+        AND ((size IS NULL AND ? IS NULL) OR size = ?)
+        AND firstChunk = ?
+      ORDER BY id
+      LIMIT 1`,
+    [source.type, source.size, source.size, source.firstChunk ?? null]
+  );
+
+export const deleteSource = async (db: SQLiteDatabase, id: number) => {
+  await db.runAsync(`DELETE FROM sources WHERE id = ?`, [id]);
+};
+
+export const renameSource = async (
+  db: SQLiteDatabase,
+  id: number,
+  newName: string
+) => {
+  await db.runAsync(`UPDATE sources SET name = ? WHERE id = ?`, [newName, id]);
+};
+
+export const getAllSources = async (db: SQLiteDatabase) => {
+  const result = await db.getAllAsync<Source>(`SELECT * FROM sources`);
+  return result;
+};
+
+export const getSourcesEnabledInChat = async (
+  db: SQLiteDatabase,
+  chatId: number
+) => {
+  const result = await db.getAllAsync<{ chatId: number; sourceId: number }>(
+    `SELECT * FROM chatSources WHERE chatId = ?`,
+    [chatId]
+  );
+
+  return result.map((item) => item.sourceId);
+};
+
+export const deactivateSource = async (
+  db: SQLiteDatabase,
+  chatId: number,
+  sourceId: number
+) => {
+  await db.runAsync(
+    `DELETE FROM chatSources WHERE chatId = ? AND sourceId = ?`,
+    [chatId, sourceId]
+  );
+};
+
+export const activateSource = async (
+  db: SQLiteDatabase,
+  chatId: number,
+  sourceId: number
+): Promise<boolean> => {
+  const relationState = await db.getFirstAsync<{
+    chatExists: number;
+    sourceExists: number;
+    alreadyEnabled: number;
+  }>(
+    `SELECT
+      EXISTS(SELECT 1 FROM chats WHERE id = ?) AS chatExists,
+      EXISTS(SELECT 1 FROM sources WHERE id = ?) AS sourceExists,
+      EXISTS(
+        SELECT 1 FROM chatSources WHERE chatId = ? AND sourceId = ?
+      ) AS alreadyEnabled`,
+    [chatId, sourceId, chatId, sourceId]
+  );
+
+  if (!relationState?.chatExists || !relationState?.sourceExists) {
+    console.warn('Skipping source activation because FK target is missing', {
+      chatId,
+      sourceId,
+      chatExists: !!relationState?.chatExists,
+      sourceExists: !!relationState?.sourceExists,
+    });
+    return false;
+  }
+
+  if (relationState.alreadyEnabled) return true;
+
+  await db.runAsync(
+    `INSERT INTO chatSources (chatId, sourceId) VALUES (?, ?)`,
+    [chatId, sourceId]
+  );
+  return true;
+};
+
+export const deleteSourceFromChats = async (
+  db: SQLiteDatabase,
+  source: Source
+) => {
+  const chats = await db.getAllAsync<{ chatId: number }>(
+    `SELECT chatId FROM chatSources WHERE sourceId = ?`,
+    [source.id]
+  );
+
+  const content = `${source.name} has been deleted and this chat can no longer use it as a source file`;
+
+  const eventMessage = {
+    role: 'event',
+    content: content,
+    timestamp: Date.now(),
+  };
+
+  await Promise.all(
+    chats.map(async (chat) => {
+      await persistMessage(db, { ...eventMessage, chatId: chat.chatId } as Omit<
+        Message,
+        'id'
+      >);
+    })
+  );
+
+  await db.runAsync(`DELETE FROM chatSources WHERE sourceId = ?`, [source.id]);
+};
+
+export const getOrphanedSources = async (
+  db: SQLiteDatabase
+): Promise<Source[]> => {
+  return db.getAllAsync<Source>(
+    `SELECT s.* FROM sources s
+     LEFT JOIN chatSources cs ON s.id = cs.sourceId
+     WHERE cs.sourceId IS NULL`
+  );
+};
+
+export const clearPhantomChat = async (db: SQLiteDatabase, chatId: number) => {
+  await db.runAsync(`DELETE FROM messages WHERE chatId = ?`, [chatId]);
+};

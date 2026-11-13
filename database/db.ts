@@ -1,0 +1,473 @@
+import { type SQLiteDatabase } from 'expo-sqlite';
+import { useChatStore } from '../store/chatStore';
+import { useLLMStore } from '../store/llmStore';
+import { useModelStore } from '../store/modelStore';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useSourceStore } from '../store/sourceStore';
+import { initSourceLinkingBoundary } from '../utils/sourceLinkingBoundary';
+import { migrateLegacyVectorStore } from './vectorStoreMigration';
+import { restoreTruncatedChatTitles } from './chatTitleMigration';
+import { resolveModelCatalog } from '../utils/fetchModelCatalog';
+import {
+  applyCatalogWhenItArrives,
+  insertCatalogModels,
+  updateCatalogRows,
+} from './catalogSync';
+import { getActiveCatalog, setActiveCatalog } from '../utils/modelCatalogState';
+import {
+  RETIRED_MODEL_NAMES,
+  RETIRED_MODEL_REPLACEMENTS,
+} from '../constants/retired-models';
+
+const discardPeakMemoryMeasuredWithTheOldMetric = async (
+  db: SQLiteDatabase
+): Promise<void> => {
+  await db.execAsync(`UPDATE benchmarks SET peakMemory = 0`);
+};
+
+export const runMigrations = async (db: SQLiteDatabase) => {
+  const modelsTableInfo = await db.getAllAsync<{ name: string }>(
+    `PRAGMA table_info(models)`
+  );
+  const hasFamily = modelsTableInfo.some((col) => col.name === 'family');
+  const hasFeatured = modelsTableInfo.some((col) => col.name === 'featured');
+  const hasExperimental = modelsTableInfo.some(
+    (col) => col.name === 'experimental'
+  );
+  const hasThinking = modelsTableInfo.some((col) => col.name === 'thinking');
+  const hasLabels = modelsTableInfo.some((col) => col.name === 'labels');
+  const hasVision = modelsTableInfo.some((col) => col.name === 'vision');
+  const hasSystemPrompt = modelsTableInfo.some(
+    (col) => col.name === 'systemPrompt'
+  );
+
+  if (!hasFeatured) {
+    await db.execAsync(
+      `ALTER TABLE models ADD COLUMN featured INTEGER DEFAULT 0`
+    );
+  }
+
+  if (!hasExperimental) {
+    await db.execAsync(
+      `ALTER TABLE models ADD COLUMN experimental INTEGER DEFAULT 0`
+    );
+  }
+
+  if (!hasFamily) {
+    await db.execAsync(
+      `ALTER TABLE models ADD COLUMN family TEXT DEFAULT NULL`
+    );
+  }
+
+  if (!hasThinking) {
+    await db.execAsync(
+      `ALTER TABLE models ADD COLUMN thinking INTEGER DEFAULT 0`
+    );
+  }
+
+  if (!hasLabels) {
+    await db.execAsync(
+      `ALTER TABLE models ADD COLUMN labels TEXT DEFAULT NULL`
+    );
+  }
+
+  if (!hasVision) {
+    await db.execAsync(
+      `ALTER TABLE models ADD COLUMN vision INTEGER DEFAULT 0`
+    );
+  }
+
+  if (!hasSystemPrompt) {
+    await db.execAsync(
+      `ALTER TABLE models ADD COLUMN systemPrompt TEXT DEFAULT NULL`
+    );
+  }
+
+  const messagesTableInfo = await db.getAllAsync<{ name: string }>(
+    `PRAGMA table_info(messages)`
+  );
+  const hasImagePath = messagesTableInfo.some(
+    (col) => col.name === 'imagePath'
+  );
+  if (!hasImagePath) {
+    await db.execAsync(
+      `ALTER TABLE messages ADD COLUMN imagePath TEXT DEFAULT NULL`
+    );
+  }
+
+  const hasDocumentName = messagesTableInfo.some(
+    (col) => col.name === 'documentName'
+  );
+  if (!hasDocumentName) {
+    await db.execAsync(
+      `ALTER TABLE messages ADD COLUMN documentName TEXT DEFAULT NULL`
+    );
+  }
+
+  const hasSourceDocuments = messagesTableInfo.some(
+    (col) => col.name === 'sourceDocuments'
+  );
+  if (!hasSourceDocuments) {
+    await db.execAsync(
+      `ALTER TABLE messages ADD COLUMN sourceDocuments TEXT DEFAULT NULL`
+    );
+  }
+
+  const hasGroundingCaveats = messagesTableInfo.some(
+    (col) => col.name === 'groundingCaveats'
+  );
+  if (!hasGroundingCaveats) {
+    await db.execAsync(
+      `ALTER TABLE messages ADD COLUMN groundingCaveats TEXT DEFAULT NULL`
+    );
+  }
+
+  const hasRetrievalStats = messagesTableInfo.some(
+    (col) => col.name === 'retrievalStats'
+  );
+  if (!hasRetrievalStats) {
+    await db.execAsync(
+      `ALTER TABLE messages ADD COLUMN retrievalStats TEXT DEFAULT NULL`
+    );
+  }
+
+  const hasStoppedByUser = messagesTableInfo.some(
+    (col) => col.name === 'stoppedByUser'
+  );
+  if (!hasStoppedByUser) {
+    await db.execAsync(
+      `ALTER TABLE messages ADD COLUMN stoppedByUser INTEGER DEFAULT 0`
+    );
+  }
+
+  const hasCutShortReason = messagesTableInfo.some(
+    (col) => col.name === 'cutShortReason'
+  );
+  if (!hasCutShortReason) {
+    await db.execAsync(
+      `ALTER TABLE messages ADD COLUMN cutShortReason TEXT DEFAULT NULL`
+    );
+  }
+
+  // Check and add thinkingEnabled to chatSettings
+  const chatSettingsTableInfo = await db.getAllAsync<{ name: string }>(
+    `PRAGMA table_info(chatSettings)`
+  );
+  const hasThinkingEnabled = chatSettingsTableInfo.some(
+    (col) => col.name === 'thinkingEnabled'
+  );
+
+  if (!hasThinkingEnabled) {
+    await db.execAsync(
+      `ALTER TABLE chatSettings ADD COLUMN thinkingEnabled INTEGER DEFAULT NULL`
+    );
+  }
+
+  const hasContextWindow = chatSettingsTableInfo.some(
+    (col) => col.name === 'contextWindow'
+  );
+
+  if (hasContextWindow) {
+    await db.execAsync(`ALTER TABLE chatSettings DROP COLUMN contextWindow`);
+  }
+
+  const hasDigest = chatSettingsTableInfo.some((col) => col.name === 'digest');
+
+  if (!hasDigest) {
+    await db.execAsync(
+      `ALTER TABLE chatSettings ADD COLUMN digest TEXT DEFAULT NULL`
+    );
+  }
+
+  // Add firstChunk column to sources
+  const sourcesTableInfo = await db.getAllAsync<{ name: string }>(
+    `PRAGMA table_info(sources)`
+  );
+  const hasFirstChunk = sourcesTableInfo.some(
+    (col) => col.name === 'firstChunk'
+  );
+  if (!hasFirstChunk) {
+    await db.execAsync(
+      `ALTER TABLE sources ADD COLUMN firstChunk TEXT DEFAULT NULL`
+    );
+  }
+
+  const benchmarksTableInfo = await db.getAllAsync<{ name: string }>(
+    `PRAGMA table_info(benchmarks)`
+  );
+  const hasPeakMemoryMetric = benchmarksTableInfo.some(
+    (col) => col.name === 'peakMemoryMetric'
+  );
+  if (!hasPeakMemoryMetric) {
+    await db.execAsync(
+      `ALTER TABLE benchmarks ADD COLUMN peakMemoryMetric TEXT DEFAULT NULL`
+    );
+    await discardPeakMemoryMeasuredWithTheOldMetric(db);
+  }
+
+  await migrateLegacyVectorStore(db);
+
+  await restoreTruncatedChatTitles(db);
+
+  // One-time cleanup of orphan rows from before FK enforcement was enabled.
+  await db.runAsync(
+    `DELETE FROM messages WHERE chatId NOT IN (SELECT id FROM chats)`
+  );
+  await db.runAsync(
+    `DELETE FROM chatSettings WHERE chatId NOT IN (SELECT id FROM chats)`
+  );
+  await db.runAsync(
+    `DELETE FROM chatSources WHERE chatId NOT IN (SELECT id FROM chats) OR sourceId NOT IN (SELECT id FROM sources)`
+  );
+  await db.runAsync(
+    `DELETE FROM chatBranches WHERE chatId NOT IN (SELECT id FROM chats) OR afterMessageId NOT IN (SELECT id FROM messages)`
+  );
+
+  await initSourceLinkingBoundary(db);
+
+  await db.runAsync(
+    `DELETE FROM models
+     WHERE source = 'built-in'
+       AND modelName IN (
+         SELECT REPLACE(modelName, ' - Quantized', '')
+         FROM models
+         WHERE source = 'built-in' AND modelName LIKE '% - Quantized'
+       )`
+  );
+  await db.runAsync(
+    `UPDATE models SET modelName = REPLACE(modelName, ' - Quantized', '')
+     WHERE source = 'built-in' AND modelName LIKE '% - Quantized'`
+  );
+
+  const catalog = getActiveCatalog();
+  const defaultModelNames = catalog.map((m) => m.modelName);
+  const placeholders = defaultModelNames.map(() => '?').join(',');
+
+  const retired = await moveChatsOffRetiredModels(db);
+
+  await db.runAsync(
+    `
+    DELETE FROM models
+    WHERE source = 'built-in' AND modelName NOT IN (${placeholders})
+    `,
+    ...defaultModelNames
+  );
+
+  await updateCatalogRows(db, catalog);
+  return retired;
+};
+
+export interface RetiredModel {
+  modelName: string;
+  replacement: string;
+  sources: string[];
+}
+
+const moveChatsOffRetiredModels = async (
+  db: SQLiteDatabase
+): Promise<RetiredModel[]> => {
+  const placeholders = RETIRED_MODEL_NAMES.map(() => '?').join(',');
+  const rows = await db.getAllAsync<{
+    id: number;
+    modelName: string;
+    modelPath: string;
+    tokenizerPath: string;
+    tokenizerConfigPath: string;
+  }>(
+    `SELECT id, modelName, modelPath, tokenizerPath, tokenizerConfigPath
+     FROM models
+     WHERE source = 'built-in' AND isDownloaded = 1
+       AND modelName IN (${placeholders})`,
+    ...RETIRED_MODEL_NAMES
+  );
+
+  if (rows.length === 0) return [];
+
+  const retiredIds = rows.map((row) => row.id);
+  const others = await db.getAllAsync<{
+    modelPath: string;
+    tokenizerPath: string;
+    tokenizerConfigPath: string;
+  }>(
+    `SELECT modelPath, tokenizerPath, tokenizerConfigPath FROM models
+     WHERE id NOT IN (${retiredIds.map(() => '?').join(',')})`,
+    ...retiredIds
+  );
+  const neededElsewhere = new Set(
+    others.flatMap((o) => [o.modelPath, o.tokenizerPath, o.tokenizerConfigPath])
+  );
+
+  const retired: RetiredModel[] = [];
+  for (const row of rows) {
+    const replacement = RETIRED_MODEL_REPLACEMENTS[row.modelName];
+    const target = await db.getFirstAsync<{ id: number }>(
+      `SELECT id FROM models WHERE source = 'built-in' AND modelName = ?`,
+      replacement
+    );
+    if (target) {
+      await db.runAsync(`UPDATE chats SET modelId = ? WHERE modelId = ?`, [
+        target.id,
+        row.id,
+      ]);
+    }
+    retired.push({
+      modelName: row.modelName,
+      replacement,
+      sources: [
+        row.modelPath,
+        row.tokenizerPath,
+        row.tokenizerConfigPath,
+      ].filter((source) => !neededElsewhere.has(source)),
+    });
+  }
+  return retired;
+};
+
+export const initDatabase = async (db: SQLiteDatabase) => {
+  await db.execAsync(`
+    PRAGMA journal_mode = 'wal';
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE IF NOT EXISTS models (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      modelName TEXT UNIQUE NOT NULL,
+      modelSize INTEGER DEFAULT NULL,
+      parameters INTEGER DEFAULT NULL,
+      source TEXT,
+      isDownloaded INTEGER DEFAULT 0,
+      modelPath TEXT,
+      tokenizerPath TEXT,
+      tokenizerConfigPath TEXT,
+      thinking INTEGER DEFAULT 0,
+      vision INTEGER DEFAULT 0,
+      featured INTEGER DEFAULT 0,
+      experimental INTEGER DEFAULT 0,
+      family TEXT DEFAULT NULL,
+      labels TEXT DEFAULT NULL,
+      systemPrompt TEXT DEFAULT NULL
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS chats (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lastUsed timestamp DEFAULT CURRENT_TIMESTAMP,
+      modelId INTEGER,
+      title TEXT DEFAULT '',
+      FOREIGN KEY (modelId) REFERENCES models (id) ON DELETE SET NULL
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      modelName TEXT,
+      timestamp timestamp DEFAULT CURRENT_TIMESTAMP,
+      chatId INTEGER,
+      role TEXT,
+      content TEXT,
+      tokensPerSecond INTEGER DEFAULT 0,
+      timeToFirstToken INTEGER DEFAULT 0,
+      imagePath TEXT DEFAULT NULL,
+      documentName TEXT DEFAULT NULL,
+      sourceDocuments TEXT DEFAULT NULL,
+      groundingCaveats TEXT DEFAULT NULL,
+      retrievalStats TEXT DEFAULT NULL,
+      stoppedByUser INTEGER DEFAULT 0,
+      cutShortReason TEXT DEFAULT NULL,
+      FOREIGN KEY (chatId) REFERENCES chats (id) ON DELETE CASCADE
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS chatSettings (
+      chatId INTEGER PRIMARY KEY NOT NULL,
+      systemPrompt TEXT DEFAULT '',
+      thinkingEnabled INTEGER DEFAULT NULL,
+      digest TEXT DEFAULT NULL,
+      FOREIGN KEY(chatId) REFERENCES chats(id) ON DELETE CASCADE
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS benchmarks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp timestamp DEFAULT CURRENT_TIMESTAMP,
+      modelId INTEGER,
+      modelName TEXT,
+      totalTime INTEGER DEFAULT 0,
+      timeToFirstToken INTEGER DEFAULT 0,
+      tokensGenerated INTEGER DEFAULT 0,
+      tokensPerSecond INTEGER DEFAULT 0,
+      peakMemory INTEGER DEFAULT 0,
+      peakMemoryMetric TEXT DEFAULT NULL,
+      FOREIGN KEY (modelId) REFERENCES models (id) ON DELETE SET NULL
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS sources (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      size INTEGER,
+      type TEXT NOT NULL,
+      firstChunk TEXT DEFAULT NULL
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS chatSources (
+      chatId INTEGER NOT NULL,
+      sourceId INTEGER NOT NULL,
+      PRIMARY KEY (chatId, sourceId),
+      FOREIGN KEY(chatId) REFERENCES chats(id) ON DELETE CASCADE,
+      FOREIGN KEY(sourceId) REFERENCES sources(id) ON DELETE CASCADE
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS chatBranches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chatId INTEGER NOT NULL,
+      afterMessageId INTEGER NOT NULL,
+      sourceChatId INTEGER NOT NULL,
+      sourceMessageId INTEGER NOT NULL,
+      sourceChatTitle TEXT DEFAULT '',
+      sourceMessagePreview TEXT DEFAULT '',
+      createdAt timestamp DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(chatId) REFERENCES chats(id) ON DELETE CASCADE,
+      FOREIGN KEY(afterMessageId) REFERENCES messages(id) ON DELETE CASCADE
+    );
+  `);
+
+  const resolved = await resolveModelCatalog();
+  setActiveCatalog(resolved.models);
+
+  // Run migration before inserting default models
+  const retired = await runMigrations(db);
+
+  useChatStore.getState().setDB(db);
+  useModelStore.getState().setDB(db);
+  await useModelStore.getState().discardRetiredModels(retired);
+  await useModelStore.getState().loadUpdateConsent();
+  useLLMStore.getState().setDB(db);
+  useSourceStore.getState().setDB(db);
+
+  const defaultSettings = await AsyncStorage.getItem('default_chat_settings');
+  if (!defaultSettings) {
+    await AsyncStorage.setItem(
+      'default_chat_settings',
+      JSON.stringify({
+        systemPrompt:
+          'You are a knowledgeable and helpful assistant. Provide clear, accurate, and well-structured responses. When given context from documents, use that information to give comprehensive answers while being concise and relevant.',
+      })
+    );
+  }
+
+  await db.withTransactionAsync(async () => {
+    await insertCatalogModels(db, getActiveCatalog());
+  });
+
+  await useModelStore.getState().loadModels();
+
+  applyCatalogWhenItArrives(db, resolved);
+};

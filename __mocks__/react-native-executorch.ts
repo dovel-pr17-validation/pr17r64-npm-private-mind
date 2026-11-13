@@ -1,0 +1,163 @@
+const makeModelConstants = (name: string) => ({
+  modelName: name,
+  modelSource: `https://huggingface.co/mock/${name}/model.pte`,
+  tokenizerSource: `https://huggingface.co/mock/${name}/tokenizer.json`,
+  tokenizerConfigSource: `https://huggingface.co/mock/${name}/tokenizer_config.json`,
+});
+
+export const QWEN3_0_6B_QUANTIZED = makeModelConstants('qwen3-0.6b-quantized');
+export const QWEN3_0_6B = makeModelConstants('qwen3-0.6b');
+export const QWEN3_1_7B = makeModelConstants('qwen3-1.7b');
+export const QWEN3_1_7B_QUANTIZED = {
+  ...makeModelConstants('qwen3-1.7b-quantized'),
+  generationConfig: { temperature: 0.6, topP: 0.95 },
+};
+export const QWEN3_4B = makeModelConstants('qwen3-4b');
+export const QWEN3_4B_QUANTIZED = makeModelConstants('qwen3-4b-quantized');
+export const LLAMA3_2_1B = makeModelConstants('llama3.2-1b');
+export const LLAMA3_2_1B_QLORA = makeModelConstants('llama3.2-1b-qlora');
+export const LLAMA3_2_1B_SPINQUANT = makeModelConstants(
+  'llama-3.2-1b-spinquant'
+);
+export const LLAMA3_2_3B = makeModelConstants('llama3.2-3b');
+export const LLAMA3_2_3B_QLORA = makeModelConstants('llama3.2-3b-qlora');
+export const LLAMA3_2_3B_SPINQUANT = makeModelConstants(
+  'llama-3.2-3b-spinquant'
+);
+export const HAMMER2_1_0_5B = makeModelConstants('hammer2.1-0.5b');
+export const HAMMER2_1_0_5B_QUANTIZED = makeModelConstants(
+  'hammer2.1-0.5b-quantized'
+);
+export const HAMMER2_1_1_5B = makeModelConstants('hammer2.1-1.5b');
+export const HAMMER2_1_1_5B_QUANTIZED = makeModelConstants(
+  'hammer2.1-1.5b-quantized'
+);
+export const HAMMER2_1_3B = makeModelConstants('hammer2.1-3b');
+export const HAMMER2_1_3B_QUANTIZED = makeModelConstants(
+  'hammer2.1-3b-quantized'
+);
+export const QWEN2_5_0_5B = makeModelConstants('qwen2.5-0.5b');
+export const QWEN2_5_0_5B_QUANTIZED = makeModelConstants(
+  'qwen2.5-0.5b-quantized'
+);
+export const QWEN2_5_1_5B = makeModelConstants('qwen2.5-1.5b');
+export const QWEN2_5_1_5B_QUANTIZED = makeModelConstants(
+  'qwen2.5-1.5b-quantized'
+);
+export const QWEN2_5_3B = makeModelConstants('qwen2.5-3b');
+export const QWEN2_5_3B_QUANTIZED = makeModelConstants('qwen2.5-3b-quantized');
+export const PHI_4_MINI_4B = makeModelConstants('phi4-mini-4b');
+export const PHI_4_MINI_4B_QUANTIZED = makeModelConstants(
+  'phi4-mini-4b-quantized'
+);
+export const LFM2_5_1_2B_INSTRUCT = makeModelConstants('lfm2.5-1.2b-instruct');
+export const LFM2_5_1_2B_INSTRUCT_QUANTIZED = makeModelConstants(
+  'lfm2.5-1.2b-instruct-quantized'
+);
+export const LFM2_VL_1_6B_QUANTIZED = makeModelConstants(
+  'lfm2-vl-1.6b-quantized'
+);
+export const LFM2_VL_450M_QUANTIZED = makeModelConstants(
+  'lfm2-vl-450m-quantized'
+);
+export const LFM2_5_VL_1_6B_QUANTIZED = makeModelConstants(
+  'lfm2.5-vl-1.6b-quantized'
+);
+export const LFM2_5_VL_450M_QUANTIZED = makeModelConstants(
+  'lfm2.5-vl-450m-quantized'
+);
+export const BIELIK_V3_0_1_5B_QUANTIZED = makeModelConstants(
+  'bielik-v3.0-1.5b-quantized'
+);
+const gemma4E2b = makeModelConstants('gemma4-e2b');
+const gemma4E2bBase = 'https://huggingface.co/mock/gemma4-e2b';
+const gemma4E2bMultimodalBase = 'https://huggingface.co/mock/gemma4-e2b-mm';
+
+export const GEMMA4_E2B_MLX_MODEL = `${gemma4E2bBase}/mlx/model.pte`;
+export const GEMMA4_E2B_VULKAN_MODEL = `${gemma4E2bBase}/vulkan/model.pte`;
+export const GEMMA4_E2B_XNNPACK_MODEL = `${gemma4E2bBase}/xnnpack/model.pte`;
+export const GEMMA4_E2B_MLX_MM = `${gemma4E2bMultimodalBase}/mlx/model.pte`;
+export const GEMMA4_E2B_VULKAN_MM = `${gemma4E2bMultimodalBase}/vulkan/model.pte`;
+export const GEMMA4_E2B_XNNPACK_MM = `${gemma4E2bMultimodalBase}/xnnpack/model.pte`;
+export const GEMMA4_E2B_TOKENIZER = gemma4E2b.tokenizerSource;
+export const GEMMA4_E2B_TOKENIZER_CONFIG = gemma4E2b.tokenizerConfigSource;
+export const WHISPER_TINY_EN = 'whisper-tiny-en';
+
+export const LLMModule = {
+  fromCustomModel: jest.fn(),
+  fromModelName: jest.fn(),
+};
+
+export const SpeechToTextModule = {
+  fromModelName: jest.fn(),
+};
+
+export const createWhisperSpeechToText = jest.fn();
+
+const whisperVariant = (backend: string) => ({
+  modelPath: `https://huggingface.co/mock/whisper-tiny.en/${backend}/whisper.pte`,
+  tokenizerPath: 'https://huggingface.co/mock/whisper-tiny.en/tokenizer.json',
+  supportedLanguages: ['en'],
+  vadModel: {
+    modelPath: 'https://huggingface.co/mock/fsmn-vad/vad.pte',
+    defaultOptions: { speechThreshold: 0.6 },
+  },
+});
+
+export const models = {
+  speechToText: {
+    WHISPER: {
+      EN: {
+        TINY: {
+          COREML_FP16: whisperVariant('coreml'),
+          XNNPACK_FP32: whisperVariant('xnnpack'),
+        },
+      },
+    },
+  },
+};
+
+export const TextEmbeddingsModule = {
+  fromCustomModel: jest.fn(),
+};
+
+export const createTextEmbedder = jest.fn(async () => ({
+  embed: jest.fn(async () => new Float32Array([0.1, 0.2, 0.3])),
+  embedWorklet: jest.fn(),
+  dispose: jest.fn(),
+}));
+
+export const ResourceFetcher = {
+  fetch: jest.fn(),
+};
+
+export enum RnExecutorchErrorCode {
+  DownloadInterrupted = 118,
+  ResourceFetcherDownloadInProgress = 181,
+  ResourceFetcherNotActive = 184,
+}
+
+export class RnExecutorchError extends Error {
+  public code: RnExecutorchErrorCode | number;
+
+  constructor(code: RnExecutorchErrorCode | number, message?: string) {
+    super(message ?? `RnExecutorchError ${code}`);
+    this.name = 'RnExecutorchError';
+    this.code = code;
+  }
+}
+
+const actualResourceFetcherUtils = () =>
+  jest.requireActual(
+    '../node_modules/react-native-executorch/lib/module/legacy/src/utils/ResourceFetcherUtils'
+  ).ResourceFetcherUtils;
+
+export const ResourceFetcherUtils = {
+  getFilenameFromUri: (uri: string): string =>
+    actualResourceFetcherUtils().getFilenameFromUri(uri),
+};
+
+export const wrapAsync =
+  <Args extends unknown[], R>(fn: (...args: Args) => R) =>
+  async (...args: Args): Promise<R> =>
+    fn(...args);

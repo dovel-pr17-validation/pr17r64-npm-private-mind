@@ -1,0 +1,92 @@
+name: Android Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "yarn"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "gradle"
+
+      - name: Install dependencies
+        run: |
+          for attempt in 1 2 3; do
+            yarn install --frozen-lockfile && exit 0
+            echo "::warning::yarn install failed on attempt $attempt"
+          done
+          exit 1
+
+      - name: Create .env file
+        run: touch .env
+
+      - name: Refuse to build with dev tools enabled
+        run: |
+          if [ -n "${EXPO_PUBLIC_DEV_TOOLS:-}" ] || grep -qs '^[[:space:]]*EXPO_PUBLIC_DEV_TOOLS=' .env .env.*; then
+            echo "EXPO_PUBLIC_DEV_TOOLS is set; a store build must not ship the dev benchmark."
+            exit 1
+          fi
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Decode keystore
+        run: |
+          echo '${{ secrets.ANDROID_KEYSTORE_BASE64 }}' | base64 --decode > android/app/release.keystore
+          if [ -f android/app/release.keystore ]; then
+            echo "✓ Keystore decoded successfully"
+          else
+            echo "✗ Failed to decode keystore"
+            exit 1
+          fi
+
+      - name: Create local.properties
+        run: |
+          cat > android/local.properties << EOF
+          MYAPP_UPLOAD_STORE_FILE=release.keystore
+          MYAPP_UPLOAD_STORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          MYAPP_UPLOAD_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}
+          MYAPP_UPLOAD_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+
+      - name: Make build script executable
+        run: chmod +x ./scripts/build-release.sh
+
+      - name: Build Android App Bundle
+        run: ./scripts/build-release.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-${{ github.run_number }}.aab
+          path: android/app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30
+
+      - name: Clean up keystore
+        if: always()
+        run: rm -f android/app/release.keystore

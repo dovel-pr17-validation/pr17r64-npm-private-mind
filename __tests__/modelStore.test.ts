@@ -1,0 +1,871 @@
+import {
+  useModelStore,
+  ModelState,
+  resetDownloadAttempts,
+} from '../store/modelStore';
+import { flushMicrotasks } from './support/resourceFetcherFake';
+import * as modelRepository from '../database/modelRepository';
+import {
+  ResourceFetcher,
+  RnExecutorchError,
+  RnExecutorchErrorCode,
+} from 'react-native-executorch/legacy';
+import { ExpoResourceFetcher } from 'react-native-executorch-expo-resource-fetcher/legacy';
+import Toast from 'react-native-toast-message';
+import { Paths } from 'expo-file-system';
+import NetInfo from '@react-native-community/netinfo';
+import { existingFiles } from '../__mocks__/expo-file-system';
+import { downloadedCopyUri } from '../utils/downloadedCopy';
+import { waitUntilOnlineAndActive } from '../utils/downloadReconnect';
+import { getModelUpdateConsent } from '../utils/modelUpdateConsent';
+import { onModelFilesReplaced } from '../utils/modelFilesReplaced';
+
+jest.mock('../database/modelRepository');
+jest.mock('@react-native-community/netinfo', () => ({
+  fetch: jest.fn(async () => ({
+    isConnected: true,
+    isInternetReachable: true,
+  })),
+  addEventListener: jest.fn(() => () => {}),
+}));
+jest.mock('../utils/downloadReconnect', () => ({
+  ...jest.requireActual('../utils/downloadReconnect'),
+  waitUntilOnlineAndActive: jest.fn(async () => true),
+}));
+
+const mockWaitUntilOnline = waitUntilOnlineAndActive as jest.Mock;
+
+const mockDb = {} as any;
+const mockFetch = ResourceFetcher.fetch as jest.Mock;
+const mockDeleteResources = ExpoResourceFetcher.deleteResources as jest.Mock;
+const mockGetAllModels = modelRepository.getAllModels as jest.Mock;
+const mockUpdateModelDownloaded =
+  modelRepository.updateModelDownloaded as jest.Mock;
+const mockRemoveModelFiles = modelRepository.removeModelFiles as jest.Mock;
+
+const baseModel = {
+  id: 1,
+  modelName: 'Test Model',
+  source: 'remote' as const,
+  isDownloaded: false,
+  modelPath: 'https://example.com/model.pte',
+  tokenizerPath: 'https://example.com/tokenizer.json',
+  tokenizerConfigPath: 'https://example.com/tokenizer_config.json',
+};
+
+beforeEach(() => {
+  useModelStore.setState({
+    db: mockDb,
+    models: [],
+    downloadedModels: [],
+    downloadStates: {},
+    updateConsent: { modelNames: [], overMobileData: false },
+  });
+  resetDownloadAttempts();
+  jest.clearAllMocks();
+  jest.spyOn(console, 'error').mockImplementation(() => {});
+  jest.spyOn(console, 'warn').mockImplementation(() => {});
+  mockGetAllModels.mockResolvedValue([]);
+});
+
+afterEach(() => {
+  jest.restoreAllMocks();
+});
+
+describe('getModelById', () => {
+  it('returns matching model', () => {
+    useModelStore.setState({ models: [{ ...baseModel, id: 3 }] });
+    expect(useModelStore.getState().getModelById(3)?.id).toBe(3);
+  });
+
+  it('returns undefined for unknown id', () => {
+    useModelStore.setState({ models: [baseModel] });
+    expect(useModelStore.getState().getModelById(999)).toBeUndefined();
+  });
+});
+
+describe('downloadModel', () => {
+  it('sets state to Downloading at start', async () => {
+    // Never resolve so we can inspect mid-flight state
+    mockFetch.mockReturnValue(new Promise(() => {}));
+
+    useModelStore.getState().downloadModel(baseModel);
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    expect(state.status).toBe(ModelState.Downloading);
+    expect(state.progress).toBe(0);
+  });
+
+  it('sets state to Downloaded with progress=1 on success', async () => {
+    mockFetch.mockResolvedValue(['/local/model.pte']);
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+
+    await useModelStore.getState().downloadModel(baseModel);
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    expect(state.status).toBe(ModelState.Downloaded);
+    expect(state.progress).toBe(1);
+  });
+
+  it('shows success toast on download complete', async () => {
+    mockFetch.mockResolvedValue(['/local/model.pte']);
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+
+    await useModelStore.getState().downloadModel(baseModel);
+
+    expect(Toast.show).toHaveBeenCalledWith(
+      expect.objectContaining({ text1: expect.stringContaining('Test Model') })
+    );
+  });
+
+  describe('when the device is short of storage', () => {
+    const GB = 1_000_000_000;
+    const mockSize = ExpoResourceFetcher.getFilesTotalSize as jest.Mock;
+    const setFreeBytes = (bytes: number | undefined) => {
+      (Paths as { availableDiskSpace?: number }).availableDiskSpace = bytes;
+    };
+
+    afterEach(() => setFreeBytes(undefined));
+
+    it('does not start a download that would not fit, and says how much space it needs', async () => {
+      setFreeBytes(0.36 * GB);
+      mockSize.mockImplementation(async (source: string) =>
+        source.endsWith('.pte') ? 1.25 * GB : 0
+      );
+
+      await useModelStore.getState().downloadModel(baseModel);
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(
+        useModelStore.getState().downloadStates[baseModel.id]?.status
+      ).toBe(ModelState.NotStarted);
+      expect(Toast.show).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text1:
+            'Not enough storage for Test Model: it needs 1.25 GB and 0.36 GB is free. Free up space and try again.',
+        })
+      );
+    });
+
+    it('only asks for room for the files that are not downloaded yet', async () => {
+      setFreeBytes(0.36 * GB);
+      mockSize.mockImplementation(async (source: string) =>
+        source.endsWith('.pte') ? 1.25 * GB : 1_000
+      );
+      existingFiles.add(downloadedCopyUri(baseModel.modelPath));
+
+      await useModelStore.getState().downloadModel(baseModel);
+      existingFiles.clear();
+
+      expect(mockFetch).toHaveBeenCalled();
+      expect(Toast.show).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          text1: expect.stringContaining('Not enough storage'),
+        })
+      );
+    });
+
+    it('blames the full disk, not the network, when a write runs out of space', async () => {
+      mockFetch.mockRejectedValue(
+        new Error('write failed: ENOSPC (No space left on device)')
+      );
+
+      await useModelStore.getState().downloadModel(baseModel);
+
+      expect(Toast.show).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text1: expect.stringContaining('out of storage'),
+        })
+      );
+      expect(Toast.show).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          text1: 'Test Model could not be downloaded.',
+        })
+      );
+    });
+  });
+
+  describe('when the connection drops mid-download', () => {
+    const connectionAbort = () => new Error('Software caused connection abort');
+
+    it('picks the download back up once the connection returns', async () => {
+      mockFetch
+        .mockRejectedValueOnce(connectionAbort())
+        .mockResolvedValue(['/path']);
+
+      await useModelStore.getState().downloadModel(baseModel);
+      await flushMicrotasks();
+
+      expect(mockWaitUntilOnline).toHaveBeenCalledTimes(1);
+      expect(
+        useModelStore.getState().downloadStates[baseModel.id]?.status
+      ).toBe(ModelState.Downloaded);
+      expect(Toast.show).not.toHaveBeenCalledWith(
+        expect.objectContaining({ props: expect.anything() })
+      );
+    });
+
+    it('says the connection is gone when it does not come back', async () => {
+      mockWaitUntilOnline.mockResolvedValueOnce(false);
+      mockFetch.mockRejectedValue(connectionAbort());
+
+      await useModelStore.getState().downloadModel(baseModel);
+      await flushMicrotasks();
+
+      expect(
+        useModelStore.getState().downloadStates[baseModel.id]?.status
+      ).toBe(ModelState.NotStarted);
+      expect(Toast.show).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text1:
+            'Test Model download stopped: no internet connection. Connect and try again.',
+          props: { onRetry: expect.any(Function) },
+        })
+      );
+    });
+
+    it('stops waiting for the connection when the user cancels', async () => {
+      mockWaitUntilOnline.mockReturnValueOnce(new Promise(() => {}));
+      mockFetch.mockRejectedValueOnce(connectionAbort());
+
+      const download = useModelStore.getState().downloadModel(baseModel);
+      await flushMicrotasks();
+      await useModelStore.getState().cancelDownload(baseModel);
+      await download;
+      await flushMicrotasks();
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(Toast.show).not.toHaveBeenCalledWith(
+        expect.objectContaining({ props: expect.anything() })
+      );
+    });
+  });
+
+  it('resets to NotStarted and shows error toast on failure', async () => {
+    mockFetch.mockRejectedValue(new Error('network error'));
+
+    await useModelStore.getState().downloadModel(baseModel);
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    expect(state.status).toBe(ModelState.NotStarted);
+    expect(state.progress).toBe(0);
+    expect(Toast.show).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text1: 'Test Model could not be downloaded.',
+        props: { onRetry: expect.any(Function) },
+      })
+    );
+  });
+
+  it('stays quiet when the user cancelled the download', async () => {
+    let rejectFetch: (error: unknown) => void = () => {};
+    mockFetch.mockImplementation(
+      () => new Promise((_, reject) => (rejectFetch = reject))
+    );
+
+    const download = useModelStore.getState().downloadModel(baseModel);
+    await useModelStore.getState().cancelDownload(baseModel);
+    rejectFetch(
+      new RnExecutorchError(RnExecutorchErrorCode.DownloadInterrupted)
+    );
+    await download;
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    expect(state.status).toBe(ModelState.NotStarted);
+    expect(state.progress).toBe(0);
+    expect(Toast.show).not.toHaveBeenCalled();
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it('speaks up when the download was interrupted without the user asking', async () => {
+    mockFetch.mockRejectedValue(
+      new RnExecutorchError(RnExecutorchErrorCode.DownloadInterrupted)
+    );
+
+    await useModelStore.getState().downloadModel(baseModel);
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    expect(state.status).toBe(ModelState.NotStarted);
+    expect(Toast.show).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text1: expect.stringContaining('could not be downloaded'),
+      })
+    );
+  });
+
+  it('ignores progress updates that arrive after download completes (race condition guard)', async () => {
+    let capturedProgressCb: (p: number) => void = () => {};
+    mockFetch.mockImplementation((cb: (p: number) => void) => {
+      capturedProgressCb = cb;
+      return Promise.resolve(['/local/model.pte']);
+    });
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+
+    await useModelStore.getState().downloadModel(baseModel);
+
+    // Simulate late progress callback firing after completion
+    capturedProgressCb(0.5);
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    // Should still be Downloaded, not overwritten back to Downloading
+    expect(state.status).toBe(ModelState.Downloaded);
+    expect(state.progress).toBe(1);
+  });
+
+  it('throttles progress updates — does not report same percentage twice', async () => {
+    let capturedCb: (p: number) => void = () => {};
+    mockFetch.mockImplementation((cb: (p: number) => void) => {
+      capturedCb = cb;
+      return new Promise((resolve) => {
+        // fire several updates then resolve
+        setTimeout(() => {
+          capturedCb(0.1);
+          capturedCb(0.1); // same percent — should be ignored
+          resolve(['/local/model.pte']);
+        }, 0);
+      });
+    });
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+
+    const setStateSpy = jest.spyOn(useModelStore, 'setState');
+    await useModelStore.getState().downloadModel(baseModel);
+
+    const progressCalls = setStateSpy.mock.calls.filter((call) => {
+      const arg =
+        typeof call[0] === 'function'
+          ? call[0](useModelStore.getState())
+          : call[0];
+      return (
+        arg?.downloadStates?.[baseModel.id]?.status ===
+          ModelState.Downloading &&
+        arg?.downloadStates?.[baseModel.id]?.progress > 0
+      );
+    });
+    // Duplicate percentage should not have been reported twice
+    expect(progressCalls.length).toBeLessThanOrEqual(1);
+    setStateSpy.mockRestore();
+  });
+});
+
+describe('cancelDownload', () => {
+  it('resets download state to NotStarted with progress 0', async () => {
+    useModelStore.setState({
+      downloadStates: {
+        [baseModel.id]: { progress: 0.5, status: ModelState.Downloading },
+      },
+    });
+
+    await useModelStore.getState().cancelDownload(baseModel);
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    expect(state.status).toBe(ModelState.NotStarted);
+    expect(state.progress).toBe(0);
+  });
+
+  it('a late progress tick from the cancelled run does not restart the card', async () => {
+    let progressCb: (p: number) => void = () => {};
+    mockFetch.mockImplementation((cb: (p: number) => void) => {
+      progressCb = cb;
+      return new Promise(() => {});
+    });
+
+    const startedAt = Date.now();
+    const now = jest.spyOn(Date, 'now').mockReturnValue(startedAt);
+
+    useModelStore.getState().downloadModel(baseModel);
+    await flushMicrotasks();
+    await useModelStore.getState().cancelDownload(baseModel);
+
+    now.mockReturnValue(startedAt + 1000);
+    progressCb(0.5);
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    expect(state.status).toBe(ModelState.NotStarted);
+    expect(state.progress).toBe(0);
+  });
+
+  it('the cancelled run does not reset the download started after it', async () => {
+    let rejectFirst: (error: unknown) => void = () => {};
+    mockFetch.mockImplementationOnce(
+      () => new Promise((_, reject) => (rejectFirst = reject))
+    );
+    mockFetch.mockImplementationOnce(() => new Promise(() => {}));
+
+    useModelStore.getState().downloadModel(baseModel);
+    await flushMicrotasks();
+    await useModelStore.getState().cancelDownload(baseModel);
+    useModelStore.getState().downloadModel(baseModel);
+
+    rejectFirst(
+      new RnExecutorchError(RnExecutorchErrorCode.DownloadInterrupted)
+    );
+    await flushMicrotasks();
+
+    const state = useModelStore.getState().downloadStates[baseModel.id];
+    expect(state.status).toBe(ModelState.Downloading);
+  });
+});
+
+describe('removeModel', () => {
+  it('skips file deletion for local models but still removes the DB row', async () => {
+    const localModel = {
+      ...baseModel,
+      source: 'local' as const,
+      isDownloaded: true,
+    };
+    useModelStore.setState({ models: [localModel] });
+    mockRemoveModelFiles.mockResolvedValue(undefined);
+
+    await useModelStore.getState().removeModel(localModel.id);
+
+    expect(mockDeleteResources).not.toHaveBeenCalled();
+    expect(mockRemoveModelFiles).toHaveBeenCalledWith(mockDb, localModel.id);
+  });
+
+  it('deletes downloaded resources and marks not-downloaded for remote models', async () => {
+    const remoteModel = { ...baseModel, isDownloaded: true };
+    mockDeleteResources.mockResolvedValue(undefined);
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+    mockRemoveModelFiles.mockResolvedValue(undefined);
+
+    useModelStore.setState({ models: [remoteModel], db: mockDb });
+    await useModelStore.getState().removeModel(remoteModel.id);
+
+    expect(mockDeleteResources).toHaveBeenCalledWith(
+      remoteModel.modelPath,
+      remoteModel.tokenizerPath,
+      remoteModel.tokenizerConfigPath
+    );
+    expect(mockUpdateModelDownloaded).toHaveBeenCalledWith(
+      mockDb,
+      remoteModel.id,
+      0
+    );
+  });
+
+  it('also deletes downloaded resources for built-in models', async () => {
+    const builtInModel = {
+      ...baseModel,
+      source: 'built-in' as const,
+      isDownloaded: true,
+    };
+    mockDeleteResources.mockResolvedValue(undefined);
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+    mockRemoveModelFiles.mockResolvedValue(undefined);
+
+    useModelStore.setState({ models: [builtInModel], db: mockDb });
+    await useModelStore.getState().removeModel(builtInModel.id);
+
+    expect(mockDeleteResources).toHaveBeenCalledWith(
+      builtInModel.modelPath,
+      builtInModel.tokenizerPath,
+      builtInModel.tokenizerConfigPath
+    );
+  });
+
+  it('removes download state entry after removal', async () => {
+    const remoteModel = { ...baseModel, isDownloaded: true };
+    useModelStore.setState({
+      models: [remoteModel],
+      downloadStates: {
+        [remoteModel.id]: { progress: 1, status: ModelState.Downloaded },
+      },
+    });
+    mockDeleteResources.mockResolvedValue(undefined);
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+    mockRemoveModelFiles.mockResolvedValue(undefined);
+
+    await useModelStore.getState().removeModel(remoteModel.id);
+
+    expect(
+      useModelStore.getState().downloadStates[remoteModel.id]
+    ).toBeUndefined();
+  });
+
+  it('does nothing for unknown model id', async () => {
+    useModelStore.setState({ models: [] });
+    await useModelStore.getState().removeModel(999);
+    expect(mockRemoveModelFiles).not.toHaveBeenCalled();
+  });
+});
+
+describe('removeModelFiles vs removeModel', () => {
+  it('removeModelFiles does not call removeModelFiles DB function (only marks not downloaded)', async () => {
+    const remoteModel = { ...baseModel, isDownloaded: true };
+    useModelStore.setState({ models: [remoteModel] });
+    mockDeleteResources.mockResolvedValue(undefined);
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+
+    await useModelStore.getState().removeModelFiles(remoteModel.id);
+
+    expect(mockUpdateModelDownloaded).toHaveBeenCalledWith(
+      mockDb,
+      remoteModel.id,
+      0
+    );
+    expect(mockRemoveModelFiles).not.toHaveBeenCalled();
+  });
+
+  it('removeModel calls removeModelFiles (DB) to fully delete the record', async () => {
+    const remoteModel = { ...baseModel, isDownloaded: true };
+    useModelStore.setState({ models: [remoteModel] });
+    mockDeleteResources.mockResolvedValue(undefined);
+    mockUpdateModelDownloaded.mockResolvedValue(undefined);
+    mockRemoveModelFiles.mockResolvedValue(undefined);
+
+    await useModelStore.getState().removeModel(remoteModel.id);
+
+    expect(mockRemoveModelFiles).toHaveBeenCalledWith(mockDb, remoteModel.id);
+  });
+});
+
+describe('a second download for the same model must not start while one is in flight', () => {
+  it('ignores a repeat call and fetches only once', async () => {
+    mockFetch.mockReturnValue(new Promise(() => {}));
+
+    useModelStore.getState().downloadModel(baseModel);
+    useModelStore.getState().downloadModel(baseModel);
+    useModelStore.getState().downloadModel(baseModel);
+    await flushMicrotasks();
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(useModelStore.getState().downloadStates[baseModel.id]!.status).toBe(
+      ModelState.Downloading
+    );
+  });
+
+  it('lets the model be downloaded again after a cancel', async () => {
+    let rejectFirst: (error: unknown) => void = () => {};
+    mockFetch.mockImplementationOnce(
+      () => new Promise((_, reject) => (rejectFirst = reject))
+    );
+    mockFetch.mockImplementationOnce(() => new Promise(() => {}));
+
+    useModelStore.getState().downloadModel(baseModel);
+    await flushMicrotasks();
+    await useModelStore.getState().cancelDownload(baseModel);
+    rejectFirst(
+      new RnExecutorchError(RnExecutorchErrorCode.DownloadInterrupted)
+    );
+
+    useModelStore.getState().downloadModel(baseModel);
+    await flushMicrotasks();
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('lets a different model download at the same time', async () => {
+    mockFetch.mockReturnValue(new Promise(() => {}));
+    const other = {
+      ...baseModel,
+      id: 2,
+      modelPath: 'https://example.com/other.pte',
+    };
+
+    useModelStore.getState().downloadModel(baseModel);
+    useModelStore.getState().downloadModel(other);
+    await flushMicrotasks();
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('updating a model the catalog moved to a newer export', () => {
+  const mockSyncPaths = modelRepository.syncBuiltInModelPaths as jest.Mock;
+  const outdated = (
+    id: number,
+    outdatedSources: string[]
+  ): modelRepository.Model => ({
+    ...baseModel,
+    id,
+    modelName: `Model ${id}`,
+    source: 'built-in',
+    isDownloaded: true,
+    modelPath: `https://hf.example/v0.11.0/${id}/model.pte`,
+    tokenizerPath: `https://hf.example/v0.11.0/${id}/tokenizer.json`,
+    tokenizerConfigPath: `https://hf.example/v0.11.0/${id}/tokenizer_config.json`,
+    outdatedSources,
+    updateRequired: true,
+  });
+
+  it('downloads the new export, records its paths and deletes the old files', async () => {
+    const model = outdated(1, ['old/model.pte', 'old/tokenizer.json']);
+    mockFetch.mockResolvedValue(['/local/file']);
+
+    await useModelStore.getState().updateOutdatedModel(model);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.any(Function),
+      model.modelPath
+    );
+    expect(mockSyncPaths).toHaveBeenCalledWith(mockDb, 1, 'Model 1');
+    expect(mockDeleteResources).toHaveBeenCalledWith(
+      'old/model.pte',
+      'old/tokenizer.json'
+    );
+  });
+
+  it('keeps the old files when the new export fails to download', async () => {
+    mockFetch.mockRejectedValue(new Error('network error'));
+
+    await useModelStore
+      .getState()
+      .updateOutdatedModel(outdated(1, ['old/model.pte']));
+
+    expect(mockSyncPaths).not.toHaveBeenCalled();
+    expect(mockDeleteResources).not.toHaveBeenCalled();
+  });
+
+  it('tells the loaded engine about the new files once they are in place', async () => {
+    const updated = { ...outdated(1, []), outdatedSources: [] };
+    mockGetAllModels.mockResolvedValue([updated]);
+    mockFetch.mockResolvedValue(['/local/file']);
+    const heard = jest.fn();
+    const stopListening = onModelFilesReplaced(heard);
+
+    await useModelStore
+      .getState()
+      .updateOutdatedModel(outdated(1, ['old/model.pte']));
+    stopListening();
+
+    expect(heard).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
+  });
+
+  it('says nothing about new files when the update did not arrive', async () => {
+    mockFetch.mockRejectedValue(new Error('network error'));
+    const heard = jest.fn();
+    const stopListening = onModelFilesReplaced(heard);
+
+    await useModelStore
+      .getState()
+      .updateOutdatedModel(outdated(1, ['old/model.pte']));
+    stopListening();
+
+    expect(heard).not.toHaveBeenCalled();
+  });
+
+  it('keeps an old file that a model still waiting for its update shares', async () => {
+    const waiting = outdated(2, ['old/shared-tokenizer.json']);
+    mockGetAllModels.mockResolvedValue([waiting]);
+    useModelStore.setState({ models: [waiting] });
+    mockFetch.mockResolvedValue(['/local/file']);
+
+    await useModelStore
+      .getState()
+      .updateOutdatedModel(
+        outdated(1, ['old/model.pte', 'old/shared-tokenizer.json'])
+      );
+
+    expect(mockDeleteResources).toHaveBeenCalledWith('old/model.pte');
+  });
+
+  it('updates every outdated model one after another', async () => {
+    const first = outdated(1, ['old/1.pte']);
+    const second = outdated(2, ['old/2.pte']);
+    const upToDate = { ...outdated(3, []), outdatedSources: undefined };
+    const models = [first, second, upToDate];
+    mockGetAllModels.mockResolvedValue(models);
+    useModelStore.setState({ models });
+    const started: string[] = [];
+    mockFetch.mockImplementation(async (_onProgress, source: string) => {
+      started.push(source);
+      return ['/local/file'];
+    });
+
+    await useModelStore.getState().updateOutdatedModels();
+
+    expect(started.filter((s) => s.endsWith('model.pte'))).toEqual([
+      first.modelPath,
+      second.modelPath,
+    ]);
+    expect(mockSyncPaths.mock.calls.map(([, id]) => id)).toEqual([1, 2]);
+  });
+});
+
+describe('a downloaded model the catalog retired', () => {
+  const spinQuant: modelRepository.Model = {
+    ...baseModel,
+    id: 8,
+    modelName: 'LLaMA 3.2 - 1B - SpinQuant',
+    source: 'built-in',
+    isDownloaded: false,
+    modelPath: 'https://hf.example/v0.11.0/spinquant.pte',
+  };
+  const retired = {
+    modelName: 'LLaMA 3.2 - 1B - QLoRa',
+    replacement: 'LLaMA 3.2 - 1B - SpinQuant',
+    sources: ['https://hf.example/v0.8.0/qlora.pte'],
+  };
+
+  it('has its files deleted and is remembered for the update notice', async () => {
+    useModelStore.setState({ retiredModels: [] });
+
+    await useModelStore.getState().discardRetiredModels([retired]);
+
+    expect(mockDeleteResources).toHaveBeenCalledWith(retired.sources[0]);
+    expect(useModelStore.getState().retiredModels).toEqual([
+      {
+        modelName: 'LLaMA 3.2 - 1B - QLoRa',
+        replacement: 'LLaMA 3.2 - 1B - SpinQuant',
+      },
+    ]);
+  });
+
+  it('is still remembered on the next start, after the migration that removed it', async () => {
+    useModelStore.setState({ retiredModels: [] });
+    await useModelStore.getState().discardRetiredModels([retired]);
+    useModelStore.setState({ retiredModels: [] });
+
+    await useModelStore.getState().discardRetiredModels([]);
+
+    expect(useModelStore.getState().retiredModels).toEqual([
+      {
+        modelName: 'LLaMA 3.2 - 1B - QLoRa',
+        replacement: 'LLaMA 3.2 - 1B - SpinQuant',
+      },
+    ]);
+  });
+
+  it('gets its replacement downloaded by the update', async () => {
+    useModelStore.setState({
+      models: [spinQuant],
+      retiredModels: [
+        {
+          modelName: retired.modelName,
+          replacement: retired.replacement,
+        },
+      ],
+    });
+    mockGetAllModels.mockResolvedValue([{ ...spinQuant, isDownloaded: true }]);
+    mockFetch.mockResolvedValue(['/local/file']);
+
+    await useModelStore.getState().updateOutdatedModels();
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.any(Function),
+      spinQuant.modelPath
+    );
+  });
+});
+
+describe('a model update the user agreed to', () => {
+  const mockNetwork = NetInfo.fetch as jest.Mock;
+  const outdated: modelRepository.Model = {
+    ...baseModel,
+    id: 5,
+    modelName: 'Qwen 2.5 - 0.5B',
+    source: 'built-in',
+    isDownloaded: true,
+    modelPath: 'https://hf.example/v0.11.0/qwen.pte',
+    outdatedSources: ['https://hf.example/v0.9.0/qwen.pte'],
+    updateRequired: true,
+  };
+
+  beforeEach(() => {
+    mockGetAllModels.mockResolvedValue([outdated]);
+    useModelStore.setState({ models: [outdated] });
+    mockFetch.mockResolvedValue(['/local/file']);
+  });
+
+  it('is remembered across starts', async () => {
+    await useModelStore
+      .getState()
+      .rememberUpdateConsent([outdated.modelName], false);
+
+    expect((await getModelUpdateConsent()).modelNames).toEqual([
+      outdated.modelName,
+    ]);
+  });
+
+  it('is forgotten once the model is updated', async () => {
+    await useModelStore
+      .getState()
+      .rememberUpdateConsent([outdated.modelName], false);
+
+    await useModelStore.getState().updateOutdatedModel(outdated);
+
+    expect(useModelStore.getState().updateConsent.modelNames).toEqual([]);
+  });
+
+  it('is forgotten when the user cancels the download', async () => {
+    await useModelStore
+      .getState()
+      .rememberUpdateConsent([outdated.modelName], false);
+
+    await useModelStore.getState().cancelDownload(outdated);
+
+    expect(useModelStore.getState().updateConsent.modelNames).toEqual([]);
+  });
+
+  it('resumes by itself on the next start over Wi-Fi', async () => {
+    mockNetwork.mockResolvedValue({ isConnected: true, type: 'wifi' });
+    await useModelStore
+      .getState()
+      .rememberUpdateConsent([outdated.modelName], false);
+
+    const resumed = await useModelStore.getState().resumeConsentedUpdates();
+    await flushMicrotasks();
+
+    expect(resumed).toBe(true);
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.any(Function),
+      outdated.modelPath
+    );
+  });
+
+  it('waits on mobile data unless the user agreed to use it', async () => {
+    mockNetwork.mockResolvedValue({ isConnected: true, type: 'cellular' });
+    await useModelStore
+      .getState()
+      .rememberUpdateConsent([outdated.modelName], false);
+
+    expect(await useModelStore.getState().resumeConsentedUpdates()).toBe(false);
+
+    await useModelStore
+      .getState()
+      .rememberUpdateConsent([outdated.modelName], true);
+
+    expect(await useModelStore.getState().resumeConsentedUpdates()).toBe(true);
+  });
+
+  it('does not resume offline', async () => {
+    mockNetwork.mockResolvedValue({ isConnected: false, type: 'none' });
+    await useModelStore
+      .getState()
+      .rememberUpdateConsent([outdated.modelName], true);
+
+    expect(await useModelStore.getState().resumeConsentedUpdates()).toBe(false);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('a newer export of a model that still loads its old one', () => {
+  it('downloads the newer export, not the files already on disk', async () => {
+    const model: modelRepository.Model = {
+      ...baseModel,
+      id: 6,
+      modelName: 'Model 6',
+      source: 'built-in',
+      isDownloaded: true,
+      modelPath: 'https://hf.example/v0.11.0/old/model.pte',
+      outdatedSources: ['https://hf.example/v0.11.0/old/model.pte'],
+      updateRequired: false,
+      latestSources: {
+        modelPath: 'https://hf.example/v0.12.0/model.pte',
+        tokenizerPath: baseModel.tokenizerPath,
+        tokenizerConfigPath: baseModel.tokenizerConfigPath,
+      },
+    };
+    mockFetch.mockResolvedValue(['/local/file']);
+
+    await useModelStore.getState().updateOutdatedModel(model);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.any(Function),
+      'https://hf.example/v0.12.0/model.pte'
+    );
+    expect(mockDeleteResources).toHaveBeenCalledWith(
+      'https://hf.example/v0.11.0/old/model.pte'
+    );
+  });
+});
