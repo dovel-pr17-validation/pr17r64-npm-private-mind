@@ -1052,16 +1052,16 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@dr.pogodin/react-native-fs@npm:^2.35.1":
-  version: 2.39.1
-  resolution: "@dr.pogodin/react-native-fs@npm:2.39.1"
+"@dr.pogodin/react-native-fs@npm:^2.41.0":
+  version: 2.41.0
+  resolution: "@dr.pogodin/react-native-fs@npm:2.41.0"
   dependencies:
     buffer: ^6.0.3
     http-status-codes: ^2.3.0
   peerDependencies:
     react: "*"
     react-native: "*"
-  checksum: 584c41db4e88c5dbe32bdc9d2948196bb95692d711fa8adc18c4be09da500dfb06ed7de4574856d129e273319485770408dbcf5cbc66fe07e475a3bf5cc9bfbf
+  checksum: efc3496e387a889e4469ccdefaa6a6d50febd402fc25f417520174242408de8d9471c850a91911a645199c3123a04c0b4015dd32dab2e6e3ddd794c1d8fb3126
   languageName: node
   linkType: hard
 
@@ -2202,12 +2202,12 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@kesha-antonov/react-native-background-downloader@npm:^4.6.3":
-  version: 4.6.3
-  resolution: "@kesha-antonov/react-native-background-downloader@npm:4.6.3"
+"@kesha-antonov/react-native-background-downloader@npm:^4.8.0":
+  version: 4.8.0
+  resolution: "@kesha-antonov/react-native-background-downloader@npm:4.8.0"
   peerDependencies:
     react-native: ">=0.57.0"
-  checksum: afe73d9e66c0db450b7d85b787b37a1a5e60ff46260f23defab2ff409cf92695af8ce553e67e2eb7612b08a6d73299854e5d2aca700463ab9c421765947924c0
+  checksum: 19882cd2420cfb04267e01f17687d5fa0f0a5016319f68a70b36e66828f345772c2419be5603f76ae4f1e9100ada7ce65164a9fe946dd61722c0a4fc4ee27276
   languageName: node
   linkType: hard
 
@@ -10015,12 +10015,12 @@ __metadata:
   resolution: "private-mind@workspace:."
   dependencies:
     "@babel/core": ^7.25.2
-    "@dr.pogodin/react-native-fs": ^2.35.1
+    "@dr.pogodin/react-native-fs": ^2.41.0
     "@eslint/eslintrc": ^3.3.7
     "@eslint/js": ^10.0.1
     "@expo-google-fonts/dm-sans": ^0.4.0
     "@gorhom/bottom-sheet": ^5.2.9
-    "@kesha-antonov/react-native-background-downloader": ^4.6.3
+    "@kesha-antonov/react-native-background-downloader": ^4.8.0
     "@lobehub/icons-static-svg": 1.95.1
     "@op-engineering/op-sqlite": ^15.2.7
     "@react-native-async-storage/async-storage": 2.2.0
